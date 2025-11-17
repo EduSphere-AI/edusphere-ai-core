@@ -1,12 +1,40 @@
 # editor files
 .idea/
+.vscode/
+*.swp
+*.swo
 
 # cache files
 __pycache__/
 .DS_Store
+*.py[cod]
+*$py.class
 
 # virtual environment
 .venv/
+venv/
+env/
+ENV/
 
 # log files
 logs/
+*.log
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Firebase Credentials
+firebase-credentials.json
+*-firebase-adminsdk-*.json
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
