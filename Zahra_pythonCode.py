@@ -115,40 +115,49 @@ def split_into_sections(all_text: str, min_words: int = 15) -> List[Dict[str, st
 
 
 # ------------------------- Section summarization ----------------------------
+# ------------------------- Section summarization ----------------------------
 
 def summarize_sections(
     sections: List[Dict[str, str]],
-    sentences_per_section: int = 3,
     language: str = "english",
 ) -> List[Dict[str, Any]]:
     """
-    Summarizing each section using the LexRank extractive summarizer.
-
-    Parameters
-    ----------
-    sections : list of dict
-        As returned by split_into_sections().
-    sentences_per_section : int
-        Number of sentences to keep per summary.
-    language : str
-        Language for the tokenizer (default: "english").
+    Summarize each section using the LexRank extractive summarizer
+    in a concise way (max 1–2 sentences per section).
 
     Returns
     -------
     List[Dict[str, Any]]
         Each dict has:
         - "section": original section name,
-        - "summary": list of summary sentences.
+        - "summary": list of 1–2 summary sentences.
     """
     summarizer = LexRankSummarizer()
     summaries: List[Dict[str, Any]] = []
 
     for section in sections:
-        content = section["content"]
+        content = section["content"].strip()
+        if not content:
+            continue
+
         parser = PlaintextParser.from_string(content, Tokenizer(language))
+        sentences = list(parser.document.sentences)
+
+        total_sentences = len(sentences)
+        if total_sentences == 0:
+            continue
+
+        # 🔹 Concise rule:
+        # very short section  → 1 sentence
+        # otherwise          → 2 sentences
+        if total_sentences <= 3:
+            n_sentences = 1
+        else:
+            n_sentences = 2
+
         summary_sentences = [
-            str(sentence)
-            for sentence in summarizer(parser.document, sentences_per_section)
+            str(sentence).strip()
+            for sentence in summarizer(parser.document, n_sentences)
         ]
 
         summaries.append(
