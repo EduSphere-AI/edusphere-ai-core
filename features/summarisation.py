@@ -25,7 +25,7 @@ BASE_DIR: Path = Path(__file__).resolve().parent
 
 # Absolute path to my PDF in the Desktop/TADS2 folder
 DEFAULT_PDF_FILES: List[Path] = [
-    Path(r"C:\Users\Ghazaleh2023\OneDrive\Desktop\TADS2\dwr-25-40-1.pdf"),
+    Path(r"./dwr-25-40-1.pdf"),
 ]
 
 # Output JSON file path
