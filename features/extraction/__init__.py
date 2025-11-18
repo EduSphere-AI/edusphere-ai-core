@@ -7,6 +7,4 @@ without using OCR. Extracts tables, charts, images, and text in a structured for
 
 from .extractor import PDFExtractor
 
-__version__ = "1.0.0"
 __all__ = ["PDFExtractor"]
-

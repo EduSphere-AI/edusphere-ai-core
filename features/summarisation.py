@@ -17,7 +17,6 @@ from sumy.parsers.plaintext import PlaintextParser
 from sumy.nlp.tokenizers import Tokenizer
 from sumy.summarizers.lex_rank import LexRankSummarizer
 
-
 # -------------------------- Paths & configuration ---------------------------
 
 # Folder where this Python file lives
@@ -31,8 +30,8 @@ DEFAULT_PDF_FILES: List[Path] = [
 # Output JSON file path
 OUTPUT_JSON_PATH: Path = BASE_DIR / "standardized_course_data.json"
 
-
 # ------------------------ NLTK setup ----------------------------------------
+
 
 def ensure_nltk_models() -> None:
     """
@@ -44,6 +43,7 @@ def ensure_nltk_models() -> None:
 
 
 # ------------------------ PDF text extraction -------------------------------
+
 
 def extract_pdf_text(pdf_path: Path) -> str:
     """
@@ -72,7 +72,9 @@ def extract_pdf_text(pdf_path: Path) -> str:
 
 # ------------------------- Section splitting --------------------------------
 
-def split_into_sections(all_text: str, min_words: int = 15) -> List[Dict[str, str]]:
+
+def split_into_sections(all_text: str,
+                        min_words: int = 15) -> List[Dict[str, str]]:
     """
     Splitting the document text into sections based on ALL-CAPS headings.
 
@@ -104,18 +106,17 @@ def split_into_sections(all_text: str, min_words: int = 15) -> List[Dict[str, st
         section_content = raw_content.strip()
 
         if len(section_content.split()) >= min_words:
-            sections.append(
-                {
-                    "section": section_name,
-                    "content": section_content,
-                }
-            )
+            sections.append({
+                "section": section_name,
+                "content": section_content,
+            })
 
     return sections
 
 
 # ------------------------- Section summarization ----------------------------
 # ------------------------- Section summarization ----------------------------
+
 
 def summarize_sections(
     sections: List[Dict[str, str]],
@@ -160,17 +161,16 @@ def summarize_sections(
             for sentence in summarizer(parser.document, n_sentences)
         ]
 
-        summaries.append(
-            {
-                "section": section["section"],
-                "summary": summary_sentences,
-            }
-        )
+        summaries.append({
+            "section": section["section"],
+            "summary": summary_sentences,
+        })
 
     return summaries
 
 
 # ------------------------- Table extraction ---------------------------------
+
 
 def extract_tables_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
     """
@@ -195,18 +195,17 @@ def extract_tables_from_pdf(pdf_path: Path) -> List[Dict[str, Any]]:
         for pg_num, page in enumerate(pdf.pages, start=1):
             tables = page.extract_tables()
             for tbl_num, table in enumerate(tables, start=1):
-                tables_data.append(
-                    {
-                        "page": pg_num,
-                        "table_number": tbl_num,
-                        "table": table,
-                    }
-                )
+                tables_data.append({
+                    "page": pg_num,
+                    "table_number": tbl_num,
+                    "table": table,
+                })
 
     return tables_data
 
 
 # ------------------------- High-level processing ----------------------------
+
 
 def process_pdf(pdf_path: Path) -> Dict[str, Any]:
     """
@@ -249,7 +248,8 @@ def save_to_json(data: Any, output_path: Path) -> None:
 
 # ------------------------- Script entry point -------------------------------
 
-def main() -> None:
+
+def summarise() -> None:
     """
     Entry point when run as a script.
     """
@@ -262,15 +262,9 @@ def main() -> None:
     standardized_data = process_all_pdfs(DEFAULT_PDF_FILES)
 
     for file_data in standardized_data:
-        print(
-            f"File: {file_data['source_file']} | "
-            f"Sections: {len(file_data['sections'])} | "
-            f"Tables: {len(file_data['tables'])}"
-        )
+        print(f"File: {file_data['source_file']} | "
+              f"Sections: {len(file_data['sections'])} | "
+              f"Tables: {len(file_data['tables'])}")
 
     save_to_json(standardized_data, OUTPUT_JSON_PATH)
     print(f"\nStandardized data saved to: {OUTPUT_JSON_PATH}")
-
-
-if __name__ == "__main__":
-    main()
