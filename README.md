@@ -202,6 +202,32 @@ Once the server is running, visit:
 - Swagger UI: `http://localhost:8000/docs`
 - ReDoc: `http://localhost:8000/redoc`
 
+## PDF Extraction
+
+The project includes an intelligent PDF extraction feature located in `features/extraction.py`.
+
+### Usage
+
+To run the extraction on a PDF file:
+
+```bash
+python features/extraction.py
+```
+
+By default, it processes `data/input.pdf`.
+
+### Options
+
+- `--pages`: Specify specific pages to extract (1-based index). Useful for debugging specific pages.
+
+```bash
+# Extract only page 4
+python features/extraction.py --pages 4
+
+# Extract pages 1, 3, and 5
+python features/extraction.py --pages 1 3 5
+```
+
 ## License
 
 MIT

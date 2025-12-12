@@ -2,7 +2,7 @@
 name = "edusphere-ai-core"
 version = "0.1.0"
 description = "Add your description here"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.121.1",
     "uvicorn>=0.38.0",
@@ -19,4 +19,11 @@ dependencies = [
     "requests>=2.31.0",
     "pdfplumber>=0.11.8",
     "ollama>=0.1.0",
+    "pandas>=2.3.3",
+    "transformers>=4.57.3",
+    "gliner>=0.2.24",
+    "pandas-stubs==2.3.3.251201",
+    "nltk>=3.9.2",
+    "scikit-learn>=1.8.0",
+    "pymupdf>=1.26.6",
 ]

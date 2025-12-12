@@ -4,7 +4,7 @@ import logging
 
 from utils.logging_config import setup_logging
 from utils.firebase import initialize_firebase
-from services import auth_router
+from services import auth_router, content_router
 from models import create_tables
 
 setup_logging()
@@ -47,3 +47,4 @@ async def health_check(name: str):
 
 
 app.include_router(auth_router)
+app.include_router(content_router)
