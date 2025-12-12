@@ -38,3 +38,9 @@ firebase-credentials.json
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Input Data
+/data
+
+# Output Data
+/output
