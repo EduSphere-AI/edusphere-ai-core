@@ -9,40 +9,153 @@ This script organizes extracted academic content into presentation slides with:
 """
 
 import json
+import hashlib
 from pathlib import Path
 from collections import defaultdict
 import re
-import ollama
 
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+except ImportError:
+    OLLAMA_AVAILABLE = False
+
+# === PRE-COMPILED REGEX PATTERNS ===
+RE_CHUNK_BOUNDARY = re.compile(r'\[CHUNK \d+\]')
+RE_NUMBERED_LINE = re.compile(r'^\d+\.\s+(.+)$')
+RE_SENTENCE_SPLIT = re.compile(r'(?<=[.!?])\s+')
+RE_JSON_COMMENTS = re.compile(r',\s*\([^)]*\)')
 
 # === CONFIG ===
 MODEL = "llama3.2"
 INPUT_FILE = r"D:\schmalkalden uni\third semester\TADS\output\extraction_result.json"
 OUTPUT_FILE = "slides/presentation.md"
+CACHE_FILE = "slides/.ollama_cache.json"
 
 # === CONSTANTS ===
-OPTIMAL_SLIDE_WORDS = 150  # Target word count per slide (aligned to slide rules)
-MAX_SLIDE_WORDS = 300      # Hard limit for slide word count
-MIN_SLIDE_WORDS = 50       # Minimum before considering slide complete
-MAX_BULLETS_PER_SLIDE = 10
+OPTIMAL_SLIDE_WORDS = 120  # Reduced for better readability
+MAX_SLIDE_WORDS = 250      # Hard limit
+MIN_SLIDE_WORDS = 30       # Minimum before considering slide complete
+MAX_BULLETS_PER_SLIDE = 8  # Reduced to avoid overcrowding
 MAX_PARAGRAPHS_PER_SLIDE = 3
+
+# Element weights (equivalent words)
+FIGURE_WEIGHT = 100
+TABLE_WEIGHT = 100
 
 # Elements to skip (non-educational content)
 SKIP_ELEMENT_TYPES = {"author", "footer", "footnote", "caption", "header"}
 SKIP_SECTION_TITLES = {"FROM THE AUTHORS", "MEDIA", "LEGAL AND EDITORIAL DETAILS"}
+SKIP_KEYWORDS = {"phone:", "fax:", "publishers", "editors", "editorial", "volume"}
+
+# === CACHING UTILITIES ===
+class OllamaCache:
+    def __init__(self, cache_file):
+        self.cache_file = Path(cache_file)
+        self.cache = self._load_cache()
+
+    def _load_cache(self):
+        if self.cache_file.exists():
+            try:
+                return json.loads(self.cache_file.read_text(encoding='utf-8'))
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
+    def _save_cache(self):
+        self.cache_file.parent.mkdir(exist_ok=True)
+        self.cache_file.write_text(json.dumps(self.cache, indent=2), encoding='utf-8')
+
+    def get(self, prompt):
+        key = hashlib.md5(prompt.encode('utf-8')).hexdigest()
+        return self.cache.get(key)
+
+    def set(self, prompt, response):
+        key = hashlib.md5(prompt.encode('utf-8')).hexdigest()
+        self.cache[key] = response
+        self._save_cache()
+
+ollama_cache = OllamaCache(CACHE_FILE)
 
 # === HELPER FUNCTIONS ===
+def remove_comments_safe(content: str) -> str:
+    """
+    Safely remove (comments) from JSON content, ignoring parentheses inside strings.
+    """
+    result = []
+    in_string = False
+    escape = False
+    in_comment = False
+    
+    for char in content:
+        if in_comment:
+            if char == ')':
+                in_comment = False
+            continue
+            
+        if in_string:
+            if escape:
+                escape = False
+            elif char == '\\':
+                escape = True
+            elif char == '"':
+                in_string = False
+            result.append(char)
+            continue
+            
+        # Not in string and not in comment
+        if char == '"':
+            in_string = True
+            result.append(char)
+        elif char == '(':
+            in_comment = True
+        else:
+            result.append(char)
+            
+    return "".join(result)
+
+def call_ollama(prompt: str, fallback_value: str = None) -> str:
+    """
+    Safely call Ollama with consistent error handling and caching.
+    Returns fallback_value if Ollama unavailable or call fails.
+    """
+    if not OLLAMA_AVAILABLE:
+        return fallback_value or ""
+    
+    # Check cache first
+    cached_response = ollama_cache.get(prompt)
+    if cached_response:
+        return cached_response
+
+    try:
+        response = ollama.generate(model=MODEL, prompt=prompt, stream=False)
+        result = response.get("response", "").strip()
+        # Cache the successful response
+        if result:
+            ollama_cache.set(prompt, result)
+        return result
+    except Exception as e:
+        return fallback_value or ""
 def generate_slide_title_ollama(items: list) -> str:
     """
     Use Ollama to generate a precise, semantic slide title from content items.
     """
     # Collect content text
-    content_text = " ".join([item.content for item in items if item.type in ("paragraph", "bullet")])
+    text_parts = []
+    for item in items:
+        if item.type in ("paragraph", "bullet"):
+            text_parts.append(item.content)
+        elif item.type in ("figure", "table"):
+            caption = item.metadata.get("caption", "")
+            if caption:
+                text_parts.append(f"[{item.type.upper()}: {caption}]")
+    
+    content_text = " ".join(text_parts)
     
     if not content_text.strip():
         return "Content"
     
-    prompt = f"""Given the following content, generate a single concise slide title (max 8 words) that captures the main concept. 
+    prompt = f"""Given the following content, generate a single concise slide title that captures the main concept. 
 Respond with ONLY the title, nothing else.
 
 Content:
@@ -50,24 +163,24 @@ Content:
 
 Title:"""
     
-    try:
-        import ollama
-        response = ollama.generate(model=MODEL, prompt=prompt, stream=False)
-        title = response.get("response", "").strip()
+    title = call_ollama(prompt, fallback_value=None)
+    if title:
         # Clean up the title
         title = title.replace('\n', '').strip('"').strip()
-        return title if len(title) > 5 and len(title) < 100 else "Key Concept"
-    except Exception as e:
-        # Fallback: extract keywords
-        keywords = []
-        for item in items: 
-            if item.type in ("paragraph", "bullet"):
-                words = [w for w in item.content.split() if len(w) > 5 and not w.endswith(",")]
-                keywords.extend(words[:3])
-        if keywords:
-            title = " ".join(keywords[:3])
-            return title if len(title) > 10 else "Key Concepts"
-        return "Content"
+        if len(title) > 5 and len(title) < 100:
+            return title
+    
+    # Fallback: extract keywords
+    keywords = []
+    for item in items: 
+        if item.type in ("paragraph", "bullet"):
+            words = [w for w in item.content.split() if len(w) > 5 and not w.endswith(",")]
+            keywords.extend(words[:3])
+    
+    if keywords:
+        title = " ".join(keywords[:3])
+        return title if len(title) > 10 else "Key Concepts"
+    return "Key Concept"
 
 def generate_slide_title(items: list) -> str:
     """
@@ -138,13 +251,10 @@ Description:
 {desc[:300]}
 
 Clear description:"""
-        try:
-            response = ollama.generate(model=MODEL, prompt=prompt, stream=False)
-            enhanced_desc = response.get("response", "").strip()
-            if enhanced_desc and len(enhanced_desc) > 10:
-                desc = enhanced_desc
-        except:
-            pass  # Use original description
+        # Pass fallback_value as None to handle missing Ollama gracefully inside call_ollama
+        enhanced_desc = call_ollama(prompt, fallback_value=None)
+        if enhanced_desc and len(enhanced_desc) > 10:
+            desc = enhanced_desc
     
     # Limit description to reasonable length
     if len(desc) > 400:
@@ -157,19 +267,14 @@ def generate_learn_controls(subchapter_title: str, slide_contents: list) -> list
     """
     Generate 4 open-ended learning control questions using Ollama at different cognitive levels.
     Questions test: comprehension, analysis, application, and critical thinking.
-    
-    Args:
-        subchapter_title: Title of the subchapter
-        slide_contents: List of all content (ContentItem objects) in subchapter
-    
-    Returns:
-        List of 4 question strings
     """
     # Combine all content for context
-    all_text = " ".join([
+    # Optimize: Use generator expression instead of list comprehension for memory efficiency
+    all_text_parts = (
         item.content for item in slide_contents 
         if item.type in ("paragraph", "bullet")
-    ])
+    )
+    all_text = " ".join(all_text_parts)
     
     if not all_text.strip():
         return []
@@ -200,29 +305,27 @@ Generate questions in this exact format (one per line, numbered 1-4):
 
 Respond ONLY with the numbered questions, nothing else:"""
 
-    try:
-        import ollama
-        response = ollama.generate(model=MODEL, prompt=prompt, stream=False)
-        text = response.get("response", "").strip()
-        
+    text = call_ollama(prompt, fallback_value=None)
+    if text:
         # Parse numbered questions
         questions = []
         for line in text.split('\n'):
-            match = re.match(r'^\d+\.\s+(.+)$', line.strip())
+            match = RE_NUMBERED_LINE.match(line.strip())
             if match:
                 q = match.group(1).strip()
                 if len(q) > 10:  # Ensure question is substantive
                     questions.append(q)
         
-        return questions[:4] if questions else []
-    except Exception as e:
-        # Fallback if Ollama unavailable
-        return [
-            f"What are the key definitions and concepts presented in {subchapter_title}?",
-            f"How do the different elements discussed in {subchapter_title} relate to and support each other?",
-            f"What are the practical or real-world applications of the information in {subchapter_title}?",
-            f"What are the limitations or assumptions underlying the content in {subchapter_title}? What further questions does this raise?"
-        ]
+        if questions:
+            return questions[:4]
+    
+    # Fallback if Ollama unavailable
+    return [
+        f"What are the key definitions and concepts presented in {subchapter_title}?",
+        f"How do the different elements discussed in {subchapter_title} relate to and support each other?",
+        f"What are the practical or real-world applications of the information in {subchapter_title}?",
+        f"What are the limitations or assumptions underlying the content in {subchapter_title}? What further questions does this raise?"
+    ]
 
 # === DOCUMENT STRUCTURE CLASSES ===
 class ContentItem:
@@ -232,10 +335,13 @@ class ContentItem:
         self.type = item_type  # 'paragraph', 'bullet', 'figure', 'table', 'section_title'
         self.content = content.strip() if isinstance(content, str) else ""
         self.metadata = metadata or {}
+        self._word_count_cache = None
     
     def word_count(self) -> int:
-        """Count words in this item."""
-        return len(self.content.split())
+        """Count words in this item (cached)."""
+        if self._word_count_cache is None:
+            self._word_count_cache = len(self.content.split())
+        return self._word_count_cache
     
     def is_structural(self) -> bool:
         """Returns True if this is a structural element (title, section_title, figure caption)"""
@@ -308,43 +414,49 @@ Do NOT add explanation or comments, ONLY the chunked text:
 
 {text}"""
     
-    try:
-        import ollama
-        response = ollama.generate(model=MODEL, prompt=prompt, stream=False)
-        result_text = response.get("response", "").strip()
-        
+    result_text = call_ollama(prompt, fallback_value=None)
+    if result_text:
         # Parse chunks from response
-        chunks = re.split(r'\[CHUNK \d+\]', result_text)
+        chunks = RE_CHUNK_BOUNDARY.split(result_text)
         chunks = [c.strip() for c in chunks if c.strip()]
-        return chunks if chunks else [text.strip()]
-    except Exception as e:
-        # Fallback to simple sentence-based chunking
-        chunks = []
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        current = []
-        current_count = 0
-        for s in sentences:
-            s_words = s.split()
-            if current_count + len(s_words) <= max_words:
-                current.append(s)
-                current_count += len(s_words)
+        if chunks:
+            return chunks
+    
+    # Fallback to simple sentence-based chunking
+    return _fallback_chunking(text, max_words)
+
+def _fallback_chunking(text: str, max_words: int) -> list:
+    """Fallback sentence-based chunking when Ollama unavailable."""
+    chunks = []
+    sentences = RE_SENTENCE_SPLIT.split(text)
+    current = []
+    current_count = 0
+    
+    for sentence in sentences:
+        s_words = sentence.split()
+        if current_count + len(s_words) <= max_words:
+            current.append(sentence)
+            current_count += len(s_words)
+        else:
+            if current:
+                chunks.append(" ".join(current).strip())
+            
+            if len(s_words) > max_words:
+                # Split very long sentences into word chunks
+                for i in range(0, len(s_words), max_words):
+                    chunk = " ".join(s_words[i:i+max_words]).strip()
+                    if chunk:
+                        chunks.append(chunk)
+                current = []
+                current_count = 0
             else:
-                if current:
-                    chunks.append(" ".join(current).strip())
-                if len(s_words) > max_words:
-                    i = 0
-                    while i < len(s_words):
-                        part = " ".join(s_words[i:i+max_words])
-                        chunks.append(part.strip())
-                        i += max_words
-                    current = []
-                    current_count = 0
-                else:
-                    current = [s]
-                    current_count = len(s_words)
-        if current:
-            chunks.append(" ".join(current).strip())
-        return chunks
+                current = [sentence]
+                current_count = len(s_words)
+    
+    if current:
+        chunks.append(" ".join(current).strip())
+    
+    return chunks if chunks else [text.strip()]
 
 def split_paragraph_into_chunks(text: str, max_words: int) -> list:
     """Split a long paragraph text into chunks using Ollama for intelligent concept-based boundaries."""
@@ -364,8 +476,10 @@ class Chapter:
     def add_slide(self, slide: Slide, subchapter: str = None):
         """Add slide to chapter and optionally track subchapter"""
         self.slides.append(slide)
-        if subchapter:
-            self.subchapters[subchapter].append(slide)
+        
+        # Ensure every slide belongs to a subchapter bucket
+        key = subchapter if subchapter else "Introduction"
+        self.subchapters[key].append(slide)
     
     def render_markdown(self) -> str:
         """Render entire chapter with learn controls at the end of each subchapter"""
@@ -377,23 +491,33 @@ class Chapter:
         if self.subtitle:
             lines.append(f"_{self.subtitle}_\n")
         
-        # Group slides by subchapter
-        subchapter_order = {}
-        for i, slide in enumerate(self.slides):
+        # Optimize: Group slides by subchapter more efficiently
+        # Use a list of keys to preserve order instead of repeated lookups
+        subchapter_order = []
+        seen_subchapters = set()
+        
+        # First pass: identify subchapters in order
+        for slide in self.slides:
             # Find which subchapter this slide belongs to
-            for subchapter_title, subchapter_slides in self.subchapters.items():
-                if slide in subchapter_slides:
-                    if subchapter_title not in subchapter_order:
-                        subchapter_order[subchapter_title] = []
-                    subchapter_order[subchapter_title].append(slide)
-                    break
+            found = False
+            for subchapter_title, slides in self.subchapters.items():
+                if slide in slides:
+                     if subchapter_title not in seen_subchapters:
+                         subchapter_order.append(subchapter_title)
+                         seen_subchapters.add(subchapter_title)
+                     found = True
+                     break
+            if not found and "Introduction" not in seen_subchapters:
+                subchapter_order.append("Introduction")
+                seen_subchapters.add("Introduction")
         
         # Render each subchapter with its slides and then its learn controls
         for subchapter_title in subchapter_order:
             lines.append(f"\n#### {subchapter_title}\n")
             
             # Render all slides in this subchapter
-            for slide in subchapter_order[subchapter_title]:
+            # Use direct lookup from pre-computed dictionary
+            for slide in self.subchapters[subchapter_title]:
                 lines.append(slide.render_markdown())
             
             # Add learn controls for this subchapter at the end
@@ -408,15 +532,17 @@ class Chapter:
 # === LOAD AND PARSE DOCUMENT ===
 print("[INFO] Loading extraction result...")
 try:
-    doc = json.load(open(INPUT_FILE, "r", encoding="utf-8"))
+    with open(INPUT_FILE, "r", encoding="utf-8") as f:
+        doc = json.load(f)
 except json.JSONDecodeError as e:
     # Try to fix common JSON corruption issues (comments, trailing commas)
     print(f"[WARN] JSON parse error at line {e.lineno}, column {e.colno}: {e.msg}")
     with open(INPUT_FILE, "r", encoding="utf-8") as f:
         content = f.read()
-    # Remove inline comments like (comment text)
-    content = re.sub(r',\s*\(.*?\)', ',', content)
-    content = re.sub(r',\s*\(.*?$', ',', content, flags=re.MULTILINE)
+    
+    # Remove inline comments like (comment text) safely
+    content = remove_comments_safe(content)
+    
     try:
         doc = json.loads(content)
         print("[OK] JSON recovered after removing corrupted comments")
@@ -447,35 +573,38 @@ for page in pages:
 # === INTELLIGENT CHUNKING ALGORITHM ===
 print("[INFO] Chunking content into slides...")
 
-chapters = []
-current_chapter = None
-current_chapter_num = 0
-current_subchapter = None
-slide_buffer = []
-buffer_word_count = 0
+class ProcessingState:
+    """Encapsulates mutable state during document processing"""
+    def __init__(self):
+        self.chapters = []
+        self.current_chapter = None
+        self.current_chapter_num = 0
+        self.current_subchapter = None
+        self.slide_buffer = []
+        self.buffer_word_count = 0
+        self.subchapter_slides = defaultdict(list)
+    
+    def flush_slide_buffer(self, title_override: str = None) -> Slide:
+        """Convert buffer contents to a slide"""
+        if not self.slide_buffer:
+            return None
+        
+        # Generate title from content if not provided
+        if not title_override:
+            # Extract from first section_title or generate from content
+            section_titles = [item.content for item in self.slide_buffer if item.type == "section_title"]
+            title_override = section_titles[0] if section_titles else "Content"
+        
+        slide = Slide(self.current_chapter_num, len(self.current_chapter.slides) + 1 if self.current_chapter else 1, 
+                      title_override, self.slide_buffer.copy())
+        
+        self.slide_buffer.clear()
+        self.buffer_word_count = 0
+        return slide
 
-def flush_slide_buffer(title_override: str = None) -> Slide:
-    """Convert buffer contents to a slide"""
-    if not slide_buffer:
-        return None
-    
-    # Generate title from content if not provided
-    if not title_override:
-        # Extract from first section_title or generate from content
-        section_titles = [item.content for item in slide_buffer if item.type == "section_title"]
-        title_override = section_titles[0] if section_titles else "Content"
-    
-    slide = Slide(current_chapter_num, len(current_chapter.slides) + 1 if current_chapter else 1, 
-                  title_override, slide_buffer.copy())
-    
-    slide_buffer.clear()
-    global buffer_word_count
-    buffer_word_count = 0
-    return slide
+state = ProcessingState()
 
 # Track subchapter sequences for learn controls
-subchapter_slides = defaultdict(list)
-
 for page in pages:
     for element in page.get("elements", []):
         el_type = element.get("type")
@@ -488,17 +617,17 @@ for page in pages:
         # === CHAPTER DETECTION ===
         if el_type == "title" and content:
             # Flush previous section before starting new chapter
-            if slide_buffer and current_chapter:
-                slide = flush_slide_buffer()
+            if state.slide_buffer and state.current_chapter:
+                slide = state.flush_slide_buffer()
                 if slide:
-                    current_chapter.add_slide(slide, current_subchapter)
-                    subchapter_slides[current_subchapter].append(slide)
+                    state.current_chapter.add_slide(slide, state.current_subchapter)
+                    state.subchapter_slides[state.current_subchapter].append(slide)
             
-            current_chapter_num += 1
+            state.current_chapter_num += 1
             main_title, subtitle = split_title_at_colon(content)
-            current_chapter = Chapter(current_chapter_num, main_title, subtitle)
-            chapters.append(current_chapter)
-            print("[INFO] Chapter {}: {} {}".format(current_chapter_num, main_title, 
+            state.current_chapter = Chapter(state.current_chapter_num, main_title, subtitle)
+            state.chapters.append(state.current_chapter)
+            print("[INFO] Chapter {}: {} {}".format(state.current_chapter_num, main_title, 
                                                      "- " + subtitle if subtitle else ""))
         
         # === SUBCHAPTER DETECTION ===
@@ -508,108 +637,108 @@ for page in pages:
                 continue
             
             # Flush buffer before new section
-            if slide_buffer and current_chapter:
-                title = generate_slide_title(slide_buffer)
-                slide = flush_slide_buffer(title)
+            if state.slide_buffer and state.current_chapter:
+                title = generate_slide_title(state.slide_buffer)
+                slide = state.flush_slide_buffer()
                 if slide:
-                    current_chapter.add_slide(slide, current_subchapter)
-                    subchapter_slides[current_subchapter].append(slide)
+                    state.current_chapter.add_slide(slide, state.current_subchapter)
+                    state.subchapter_slides[state.current_subchapter].append(slide)
             
-            current_subchapter = content
-            slide_buffer = []
-            buffer_word_count = 0
+            state.current_subchapter = content
+            state.slide_buffer = []
+            state.buffer_word_count = 0
         
         # === CONTENT COLLECTION ===
         elif el_type == "paragraph" and content:
             # Skip editorial/administrative paragraphs
-            if any(keyword in content.lower()[:100] for keyword in ["phone:", "fax:", "publishers", "editors", "editorial", "volume"]):
+            content_preview = content.lower()[:100]
+            if any(keyword in content_preview for keyword in SKIP_KEYWORDS):
                 continue
 
             # If paragraph is exceptionally long, split into multiple paragraph items
             chunks = split_paragraph_into_chunks(content, MAX_SLIDE_WORDS)
             for chunk in chunks:
                 item = ContentItem("paragraph", chunk)
-                slide_buffer.append(item)
-                buffer_word_count += item.word_count()
+                state.slide_buffer.append(item)
+                state.buffer_word_count += item.word_count()
 
                 # Flush if buffer reaches target
-                if buffer_word_count >= OPTIMAL_SLIDE_WORDS:
-                    title = generate_slide_title(slide_buffer)
-                    slide = flush_slide_buffer(title)
-                    if slide and current_chapter:
-                        current_chapter.add_slide(slide, current_subchapter)
-                        subchapter_slides[current_subchapter].append(slide)
+                if state.buffer_word_count >= OPTIMAL_SLIDE_WORDS:
+                    title = generate_slide_title(state.slide_buffer)
+                    slide = state.flush_slide_buffer(title)
+                    if slide and state.current_chapter:
+                        state.current_chapter.add_slide(slide, state.current_subchapter)
+                        state.subchapter_slides[state.current_subchapter].append(slide)
         
         elif el_type == "bullet_point" and element.get("bullet_items"):
             for bullet_text in element.get("bullet_items", []):
                 if bullet_text.strip():
                     item = ContentItem("bullet", bullet_text.strip())
-                    slide_buffer.append(item)
-                    buffer_word_count += item.word_count()
+                    state.slide_buffer.append(item)
+                    state.buffer_word_count += item.word_count()
             
             # Flush if too many bullets
-            bullet_count = sum(1 for i in slide_buffer if i.type == "bullet")
+            bullet_count = sum(1 for i in state.slide_buffer if i.type == "bullet")
             if bullet_count >= MAX_BULLETS_PER_SLIDE:
-                title = generate_slide_title(slide_buffer)
-                slide = flush_slide_buffer(title)
-                if slide and current_chapter:
-                    current_chapter.add_slide(slide, current_subchapter)
-                    subchapter_slides[current_subchapter].append(slide)
-                buffer_word_count = 0
+                title = generate_slide_title(state.slide_buffer)
+                slide = state.flush_slide_buffer(title)
+                if slide and state.current_chapter:
+                    state.current_chapter.add_slide(slide, state.current_subchapter)
+                    state.subchapter_slides[state.current_subchapter].append(slide)
+                state.buffer_word_count = 0
         
         # === FIGURE/TABLE HANDLING (influences chunk size) ===
-        elif el_type == "figure":
-            fig_id = element.get("id")
-            if fig_id in media_index:
-                media = media_index[fig_id]
-                
-                # Flush current buffer first
-                if slide_buffer and current_chapter:
-                    title = generate_slide_title(slide_buffer)
-                    slide = flush_slide_buffer(title)
-                    if slide:
-                        current_chapter.add_slide(slide, current_subchapter)
-                        subchapter_slides[current_subchapter].append(slide)
-                    slide_buffer.clear()
-                    buffer_word_count = 0
-                
-                # Create dedicated figure slide
-                fig_item = ContentItem("figure", media["caption"], metadata=media)
-                fig_slide = Slide(current_chapter_num, len(current_chapter.slides) + 1 if current_chapter else 1,
-                                 f"Figure: {media['caption']}", [fig_item])
-                if current_chapter:
-                    current_chapter.add_slide(fig_slide, current_subchapter)
-                    subchapter_slides[current_subchapter].append(fig_slide)
-        
-        elif el_type == "table":
-            # Similar handling for tables
-            if slide_buffer and current_chapter:
-                title = generate_slide_title(slide_buffer)
-                slide = flush_slide_buffer(title)
-                if slide:
-                    current_chapter.add_slide(slide, current_subchapter)
-                    subchapter_slides[current_subchapter].append(slide)
-                slide_buffer.clear()
-                buffer_word_count = 0
+        elif el_type in ("figure", "table"):
+            # Determine element item and weight
+            item = None
+            weight = 0
             
-            table_item = ContentItem("table", "Table data", metadata={"caption": content or "Data Table"})
-            table_slide = Slide(current_chapter_num, len(current_chapter.slides) + 1 if current_chapter else 1,
-                               f"Table: {content}", [table_item])
-            if current_chapter:
-                current_chapter.add_slide(table_slide, current_subchapter)
-                subchapter_slides[current_subchapter].append(table_slide)
+            if el_type == "figure":
+                fig_id = element.get("id")
+                if fig_id in media_index:
+                    media = media_index[fig_id]
+                    item = ContentItem("figure", media["caption"], metadata=media)
+                    weight = FIGURE_WEIGHT
+            elif el_type == "table":
+                item = ContentItem("table", "Table data", metadata={"caption": content or "Data Table"})
+                weight = TABLE_WEIGHT
+            
+            if item:
+                # Check if we should flush current buffer first
+                 # Flush if adding this would exceed max size
+                 if state.buffer_word_count + weight > MAX_SLIDE_WORDS:
+                     if state.slide_buffer:
+                         title = generate_slide_title(state.slide_buffer)
+                         slide = state.flush_slide_buffer(title)
+                         if slide and state.current_chapter:
+                             state.current_chapter.add_slide(slide, state.current_subchapter)
+                             state.subchapter_slides[state.current_subchapter].append(slide)
+                 
+                 # Add item to buffer (either existing or fresh)
+                 state.slide_buffer.append(item)
+                 state.buffer_word_count += weight
+                 
+                 # Check if we should flush NOW (if slide is now "full enough")
+                 # We use a threshold slightly higher than OPTIMAL to allow combining fig + text
+                 # but if it's already big, flush to avoid overcrowding next text
+                 if state.buffer_word_count >= OPTIMAL_SLIDE_WORDS * 1.5:
+                      title = generate_slide_title(state.slide_buffer)
+                      slide = state.flush_slide_buffer(title)
+                      if slide and state.current_chapter:
+                         state.current_chapter.add_slide(slide, state.current_subchapter)
+                         state.subchapter_slides[state.current_subchapter].append(slide)
 
 # Flush remaining buffer
-if slide_buffer and current_chapter:
-    title = generate_slide_title(slide_buffer)
-    slide = flush_slide_buffer(title)
+if state.slide_buffer and state.current_chapter:
+    title = generate_slide_title(state.slide_buffer)
+    slide = state.flush_slide_buffer(title)
     if slide:
-        current_chapter.add_slide(slide, current_subchapter)
-        subchapter_slides[current_subchapter].append(slide)
+        state.current_chapter.add_slide(slide, state.current_subchapter)
+        state.subchapter_slides[state.current_subchapter].append(slide)
 
 # === GENERATE LEARN CONTROLS ===
 print("[INFO] Generating learn control questions...")
-for chapter in chapters:
+for chapter in state.chapters:
     for subchapter_title, slides in chapter.subchapters.items():
         # Collect all content from subchapter slides
         all_content = []
@@ -628,7 +757,7 @@ output_lines.append("# Presentation Slide Deck\n")
 output_lines.append("_Generated from extracted academic document_\n")
 output_lines.append("---\n")
 
-for chapter in chapters:
+for chapter in state.chapters:
     output_lines.append(chapter.render_markdown())
 
 presentation_text = "\n".join(output_lines)
@@ -638,19 +767,19 @@ Path(OUTPUT_FILE).parent.mkdir(exist_ok=True)
 Path(OUTPUT_FILE).write_text(presentation_text, encoding="utf-8")
 
 # Statistics
-total_slides = sum(len(ch.slides) for ch in chapters)
-total_subchapters = sum(len(ch.subchapters) for ch in chapters)
-slides_with_questions = sum(len(ch.learn_controls) for ch in chapters)
+total_slides = sum(len(ch.slides) for ch in state.chapters)
+total_subchapters = sum(len(ch.subchapters) for ch in state.chapters)
+slides_with_questions = sum(len(ch.learn_controls) for ch in state.chapters)
 
 print("[OK] Presentation created: {}".format(OUTPUT_FILE))
-print("[INFO] Total chapters: {}".format(len(chapters)))
+print("[INFO] Total chapters: {}".format(len(state.chapters)))
 print("[INFO] Total slides: {}".format(total_slides))
 print("[INFO] Total subchapters: {}".format(total_subchapters))
 print("[INFO] Slides with learn controls: {}".format(slides_with_questions))
 
 # === EXPORT JSON BACKUP ===
 slides_data = []
-for chapter in chapters:
+for chapter in state.chapters:
     for slide in chapter.slides:
         slides_data.append({
             "chapter": chapter.chapter_num,
@@ -666,7 +795,7 @@ for chapter in chapters:
 
 json_output = {
     "metadata": {
-        "total_chapters": len(chapters),
+        "total_chapters": len(state.chapters),
         "total_slides": total_slides,
         "total_subchapters": total_subchapters,
         "source": INPUT_FILE
@@ -681,7 +810,7 @@ json_output = {
             "subchapters": list(ch.subchapters.keys()),
             "learn_controls": {k: v for k, v in ch.learn_controls.items()}
         }
-        for ch in chapters
+        for ch in state.chapters
     ]
 }
 
