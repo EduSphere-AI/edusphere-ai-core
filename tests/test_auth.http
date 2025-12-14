@@ -1,0 +1,110 @@
+### Test Authentication Endpoints
+
+# Note: Replace localhost:8000 with your server address if different
+
+### 1. Register a new user with email/password
+POST http://localhost:8000/auth/register
+Content-Type: application/json
+
+{
+  "email": "test@example.com",
+  "password": "securepassword123",
+  "full_name": "Test User"
+}
+
+###
+
+### 2. Login with email/password
+POST http://localhost:8000/auth/login
+Content-Type: application/json
+
+{
+  "email": "test@example.com",
+  "password": "securepassword123"
+}
+
+###
+
+### 3. Google Authentication
+# First, get a Firebase ID token from your client app
+# Then send it to this endpoint
+POST http://localhost:8000/auth/google
+Content-Type: application/json
+
+{
+  "firebase_token": "your-firebase-id-token-here",
+  "full_name": "Google User"
+}
+
+###
+
+### 4. Get current user info (protected route)
+# Replace <your_jwt_token> with the access_token from login/register response
+GET http://localhost:8000/auth/me
+Authorization: Bearer <your_jwt_token>
+
+###
+
+### 5. Test endpoint (no auth required)
+GET http://localhost:8000/auth/test
+
+###
+
+### Example: Register, Login, and Access Protected Route
+
+# Step 1: Register
+POST http://localhost:8000/auth/register
+Content-Type: application/json
+
+{
+  "email": "newuser@example.com",
+  "password": "mypassword123",
+  "full_name": "New User"
+}
+
+# Copy the access_token from the response
+
+###
+
+# Step 2: Access protected route with token
+# Replace the token below with the one you copied
+GET http://localhost:8000/auth/me
+Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJuZXd1c2VyQGV4YW1wbGUuY29tIiwidXNlcl9pZCI6MSwiZXhwIjoxNzMxNDE2NDAwLCJpYXQiOjE3MzEzMzAwMDB9.example
+
+###
+
+### Error Cases
+
+# Login with wrong password
+POST http://localhost:8000/auth/login
+Content-Type: application/json
+
+{
+  "email": "test@example.com",
+  "password": "wrongpassword"
+}
+
+###
+
+# Register with existing email
+POST http://localhost:8000/auth/register
+Content-Type: application/json
+
+{
+  "email": "test@example.com",
+  "password": "anotherpassword",
+  "full_name": "Duplicate User"
+}
+
+###
+
+# Access protected route without token
+GET http://localhost:8000/auth/me
+
+###
+
+# Access protected route with invalid token
+GET http://localhost:8000/auth/me
+Authorization: Bearer invalid_token_here
+
+###
