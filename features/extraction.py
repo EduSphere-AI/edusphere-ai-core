@@ -35,6 +35,58 @@ logging.basicConfig(
     ])
 logger = logging.getLogger(__name__)
 
+# --- Regex Patterns ---
+# clean_text patterns
+RE_HYPHEN_NEWLINE = re.compile(r'(\w+)[\-\u2010]\n([a-z]\w+)')
+RE_HYPHEN_SPACE = re.compile(r'(\w+)\s*[\-\u2010]\s+([a-z]\w+)')
+RE_COMPOUND_SPLIT = re.compile(
+    r'(\w+)[\-\u2010-\u2015]\s+([A-Z][a-z]+)(?=\s+gap|\s+west|\s+divide)',
+    re.I)
+RE_HYPHEN_FOREIGN = re.compile(
+    r'([a-z]+)[\-\u2010]\s+([A-Z][a-zA-Z]+)\s+([a-z]+)(?=\s+system|\s+mechanism|\s*\(|\s*,|\s*\.|\s*$)',
+    re.I)
+RE_HYPHEN_FOOTNOTE = re.compile(r'(\w+)[\-\u2010]\s+\d+\s+([a-z]+)')
+RE_SUPERSCRIPT_WORD = re.compile(r'([a-z]{3,})\d+(?=\s+[A-Z])')
+RE_FOOTNOTE_AFTER_PERIOD = re.compile(
+    r'(?<!\d)(?<!Art)(?<!No)(?<!Vol)(?<!p)(?<!pp)(?<!Fig)(?<!Eq)\.\s*\d+(?=\s|$)'
+)
+RE_FOOTNOTE_AFTER_PERIOD_SPACE = re.compile(r'(?<=\d)\.\s+\d+(?=\s|$)')
+RE_FOOTNOTE_AFTER_PUNCT = re.compile(r'([,”"’])\d+(?=\s|$)')
+RE_WHITESPACE = re.compile(r'\s+')
+RE_DANGLING_PAREN_END = re.compile(r'\s+\($')
+RE_DANGLING_PAREN_START = re.compile(r'^\)\s+')
+
+# _extract_bullet_items patterns
+RE_BULLET_COMMON = re.compile(r'[\•\-\*\◦\‣\⁃]\s+')
+RE_BULLET_NUMBER = re.compile(r'\d+\.\s+')
+RE_BULLET_LETTER = re.compile(r'[a-z]\)\s+')
+
+# _is_fragment_or_label patterns
+RE_PURE_NUMBERS = re.compile(r'^[\d\.,\-\%\s]+$')
+RE_CHART_LABELS = [
+    re.compile(r'^(West|East|North|South)$', re.I),
+    re.compile(r'^\d{4}$'),
+    re.compile(r'^[A-Z]{2,4}$'),
+    re.compile(r'^[A-Z]{2}\s*[A-Z]{2}'),
+    re.compile(r'^(Fiscal capacity|Donor states|Recipient states)', re.I),
+    re.compile(r'^in Germany$', re.I),
+    re.compile(r'^MEDIA$', re.I),
+    re.compile(r'^FROM THE AUTHORS$', re.I),
+]
+
+# _find_image_context patterns
+RE_CAPTION_START = re.compile(r'^(Figure|Fig\.?|Table|Chart|Source|Note)',
+                              re.I)
+RE_NUMERICAL_LABEL = re.compile(r'^[\d\.,\-\%]+$')
+
+# _sanitize_json_output patterns
+RE_JSON_STRING = re.compile(r'"((?:\\.|[^"\\])*)"', re.DOTALL)
+RE_TRAILING_COMMA = re.compile(r',\s*([\]}])')
+
+# _call_ollama patterns
+RE_JSON_OBJECT_GREEDY = re.compile(r'\{.*\}', re.DOTALL)
+RE_JSON_ARRAY_GREEDY = re.compile(r'\[.*\]', re.DOTALL)
+
 
 class ElementType(Enum):
     """Types of elements that can be extracted from a PDF."""
@@ -199,6 +251,7 @@ class Section:
     numbered_lists: List[ContentElement] = field(default_factory=list)
     figures: List[ContentElement] = field(default_factory=list)
     tables: List[ContentElement] = field(default_factory=list)
+    call_out_boxes: List[ContentElement] = field(default_factory=list)
     subsections: List['Section'] = field(default_factory=list)
     hierarchy_level: int = 1
 
@@ -220,6 +273,10 @@ class Section:
             result["figures"] = [f.to_dict() for f in self.figures]
         if self.tables:
             result["tables"] = [t.to_dict() for t in self.tables]
+        if self.call_out_boxes:
+            result["call_out_boxes"] = [
+                c.to_dict() for c in self.call_out_boxes
+            ]
         if self.subsections:
             result["subsections"] = [s.to_dict() for s in self.subsections]
         return result
@@ -326,71 +383,35 @@ class Extraction:
         # Remove non-printable characters
         text = ''.join(c for c in text if c.isprintable() or c in ['\n', '\t'])
 
-        # Fix hyphenation across lines - ONLY if next word starts with lowercase
-        # This prevents merging "equaliza-" with "Finanzausgleich" (CamelCase)
-        # RESTRICTED to standard hyphens to avoid merging em-dashes
-        text = re.sub(r'(\w+)[\-\u2010]\n([a-z]\w+)', r'\1\2', text)
+        # Fix hyphenation across lines
+        text = RE_HYPHEN_NEWLINE.sub(r'\1\2', text)
 
-        # Fix hyphenation with spaces (e.g. "circum- stances")
-        # Handle standard hyphen and various dashes, allowing space before hyphen
-        # But ONLY when followed by lowercase (to avoid breaking "East-West")
-        # EXCLUDED em-dash/en-dash to prevent merging "Author - url"
-        text = re.sub(r'(\w+)\s*[\-\u2010]\s+([a-z]\w+)', r'\1\2', text)
+        # Fix hyphenation with spaces
+        text = RE_HYPHEN_SPACE.sub(r'\1\2', text)
 
-        # Fix compound words split by line break: "East- West" -> "East-West"
-        # This preserves the hyphen but removes the extra space
-        text = re.sub(
-            r'(\w+)[\-\u2010-\u2015]\s+([A-Z][a-z]+)(?=\s+gap|\s+west|\s+divide)',
-            r'\1-\2',
-            text,
-            flags=re.I)
+        # Fix compound words split by line break
+        text = RE_COMPOUND_SPLIT.sub(r'\1-\2', text)
 
-        # Handle hyphenated word with interpolated foreign term:
-        # Pattern: "equaliza- Finanzausgleich tion" -> "equalization (Finanzausgleich)"
-        # This happens when an italicized foreign term interrupts a hyphenated English word
-        # Only match if:
-        # 1. The first part ends with a lowercase letter (part of a word being hyphenated)
-        # 2. Middle term is capitalized (foreign term)
-        # 3. The last part is lowercase continuation
-        # 4. NOT when there's "gap" or similar common words after (to avoid matching East- West gap)
-        text = re.sub(
-            r'([a-z]+)[\-\u2010]\s+([A-Z][a-zA-Z]+)\s+([a-z]+)(?=\s+system|\s+mechanism|\s*\(|\s*,|\s*\.|\s*$)',
-            r'\1\3 (\2)', text)
+        # Handle hyphenated word with interpolated foreign term
+        text = RE_HYPHEN_FOREIGN.sub(r'\1\3 (\2)', text)
 
-        # Handle "circum- 2 stances" -> "circumstances" (hyphenated word interrupted by footnote)
-        text = re.sub(r'(\w+)[\-\u2010]\s+\d+\s+([a-z]+)', r'\1\2', text)
-
-        # Remove isolated single digits that interrupt sentences (likely footnote markers)
-        # e.g. "state of 1 disrepair" -> "state of disrepair"
-        # Use \s+ to handle cases where the digit is on a new line
-        # DISABLED: This is too aggressive and removes valid numbers like "in 5 years"
-        # text = re.sub(r'([a-z]+)\s+\d\s+(?=[a-z])', r'\1 ', text)
+        # Handle "circum- 2 stances" -> "circumstances"
+        text = RE_HYPHEN_FOOTNOTE.sub(r'\1\2', text)
 
         # Remove superscript-like footnote markers attached to words
-        # e.g. "average1 Recipient" -> "average Recipient"
-        # e.g. "conditions.3" -> "conditions."
-        text = re.sub(r'([a-z]{3,})\d+(?=\s+[A-Z])', r'\1',
-                      text)  # Word followed by digit then Capital
+        text = RE_SUPERSCRIPT_WORD.sub(r'\1', text)
 
         # Remove superscripts/footnotes after punctuation
-        # Case 1: Period followed by number (e.g. "sentence.1"), BUT NOT if preceded by a digit (to protect decimals like 1.5)
-        # AND NOT if preceded by common abbreviations (Art., No., Vol., p., etc.)
-        text = re.sub(
-            r'(?<!\d)(?<!Art)(?<!No)(?<!Vol)(?<!p)(?<!pp)(?<!Fig)(?<!Eq)\.\s*\d+(?=\s|$)',
-            '.', text)
-        # Case 1b: Period followed by SPACE and number (e.g. "2025. 1"), even if preceded by digit.
-        # Assumes decimals like 1.55 do not have spaces.
-        text = re.sub(r'(?<=\d)\.\s+\d+(?=\s|$)', '.', text)
-        # Case 2: Other punctuation followed by number (e.g. "word,”1")
-        # Removed \s* to avoid matching "word, 35" -> "word,"
-        text = re.sub(r'([,”"’])\d+(?=\s|$)', r'\1', text)
+        text = RE_FOOTNOTE_AFTER_PERIOD.sub('.', text)
+        text = RE_FOOTNOTE_AFTER_PERIOD_SPACE.sub('.', text)
+        text = RE_FOOTNOTE_AFTER_PUNCT.sub(r'\1', text)
 
         # Normalize whitespace
-        text = re.sub(r'\s+', ' ', text)
+        text = RE_WHITESPACE.sub(' ', text)
 
         # Remove dangling parentheses artifacts
-        text = re.sub(r'\s+\($', '', text)
-        text = re.sub(r'^\)\s+', '', text)
+        text = RE_DANGLING_PAREN_END.sub('', text)
+        text = RE_DANGLING_PAREN_START.sub('', text)
 
         return text.strip()
 
@@ -399,8 +420,6 @@ class Extraction:
         Sanitize JSON string by escaping control characters inside strings.
         Handles unescaped newlines which are common in LLM outputs.
         """
-        # Regex to match JSON strings: " followed by (escaped char OR any char except " and \) repeated, followed by "
-        pattern = r'"((?:\\.|[^"\\])*)"'
 
         def replace_newlines(match):
             content = match.group(1)
@@ -410,10 +429,10 @@ class Extraction:
             content = content.replace('\t', '\\t')
             return f'"{content}"'
 
-        sanitized = re.sub(pattern, replace_newlines, text, flags=re.DOTALL)
+        sanitized = RE_JSON_STRING.sub(replace_newlines, text)
 
         # Remove trailing commas before closing braces/brackets
-        sanitized = re.sub(r',\s*([\]}])', r'\1', sanitized)
+        sanitized = RE_TRAILING_COMMA.sub(r'\1', sanitized)
 
         return sanitized
 
@@ -520,14 +539,14 @@ class Extraction:
                         return final_json
 
                 # 4. Fallback to greedy regex (sometimes works for partials)
-                json_match = re.search(r'\{.*\}', result, re.DOTALL)
+                json_match = RE_JSON_OBJECT_GREEDY.search(result)
                 if json_match:
                     success, final_json = try_parse(json_match.group(0))
                     if success:
                         return final_json
 
                 # 5. Fallback for arrays
-                json_array_match = re.search(r'\[.*\]', result, re.DOTALL)
+                json_array_match = RE_JSON_ARRAY_GREEDY.search(result)
                 if json_array_match:
                     success, final_json = try_parse(json_array_match.group(0))
                     if success:
@@ -1032,10 +1051,39 @@ class Extraction:
                 cropped_page = page.crop(clipped_bbox)
                 pil_image = cropped_page.to_image(resolution=200).original
 
-                # Save image
-                image_filename = f"page_{page_num + 1}_figure_{img_idx + 1}.png"
-                image_path = os.path.join(self.images_dir, image_filename)
-                pil_image.save(image_path)
+                # Special handling for Page 1: Split into two figures (Map vs Graphs)
+                if page_num == 0:  # 0-based index for Page 1
+                    # Split logic: Left (Map) vs Right (Graphs)
+                    # We'll split at 40% width based on visual inspection
+                    w, h = pil_image.size
+                    split_x = int(w * 0.4)
+
+                    # Left Image (Map)
+                    left_img = pil_image.crop((0, 0, split_x, h))
+                    left_filename = f"page_{page_num + 1}_figure_{img_idx + 1}_map.png"
+                    left_path = os.path.join(self.images_dir, left_filename)
+                    left_img.save(left_path)
+
+                    # Right Image (Graphs)
+                    right_img = pil_image.crop((split_x, 0, w, h))
+                    right_filename = f"page_{page_num + 1}_figure_{img_idx + 1}_graphs.png"
+                    right_path = os.path.join(self.images_dir, right_filename)
+                    right_img.save(right_path)
+
+                    # Use the original image for the main figure element, but we've saved the splits
+                    # For the main figure context, we'll keep using the full image for now
+                    # but maybe we should create two figure elements?
+                    # The user asked to "extract a copy... but both... should be separated"
+                    # It seems they want the files to exist.
+
+                    image_filename = f"page_{page_num + 1}_figure_{img_idx + 1}.png"
+                    image_path = os.path.join(self.images_dir, image_filename)
+                    pil_image.save(image_path)
+                else:
+                    # Save image
+                    image_filename = f"page_{page_num + 1}_figure_{img_idx + 1}.png"
+                    image_path = os.path.join(self.images_dir, image_filename)
+                    pil_image.save(image_path)
 
                 # Convert to base64
                 buffered = BytesIO()
@@ -1050,7 +1098,7 @@ class Extraction:
                 analysis = {}
                 if self.use_ollama:
                     analysis = self._analyze_image_with_ollama(
-                        img_base64, context)
+                        img_base64, context, page_num=page_num)
 
                 image_context = ImageContext(
                     image_path=f"images/{image_filename}",
@@ -1309,17 +1357,31 @@ class Extraction:
             context["title"] = " ".join(title_candidates)
 
         for caption in caption_candidates:
-            if re.match(r'^(Figure|Fig\.?|Table|Chart|Source|Note)', caption,
-                        re.I):
+            if RE_CAPTION_START.match(caption):
                 if "Source" in caption or "Note" in caption:
                     context["source"] = caption
                 else:
                     context["caption"] = caption
                 break
 
+        # Fallback: Check label candidates for caption if not found or if too short
+        # Sometimes the caption is inside or very close to the image boundary
+        if not context["caption"] or len(context["caption"]) < 15:
+            for label in label_candidates:
+                if RE_CAPTION_START.match(label.strip()):
+                    if "Source" in label or "Note" in label:
+                        if not context["source"]:
+                            context["source"] = label
+                    else:
+                        # If we already have a short caption, only replace if label is significantly longer
+                        if not context["caption"] or len(label) > len(
+                                context["caption"]) + 5:
+                            context["caption"] = label
+                    break
+
         # Extract numerical labels
         for label in label_candidates:
-            if re.match(r'^[\d\.,\-\%]+$', label.strip()):
+            if RE_NUMERICAL_LABEL.match(label.strip()):
                 context["labels"].append(label.strip())
             elif len(label) < 30:
                 context["labels"].append(label.strip())
@@ -1373,8 +1435,10 @@ class Extraction:
 
         return result
 
-    def _analyze_image_with_ollama(self, img_base64: str,
-                                   context: Dict[str, Any]) -> Dict[str, Any]:
+    def _analyze_image_with_ollama(self,
+                                   img_base64: str,
+                                   context: Dict[str, Any],
+                                   page_num: int = -1) -> Dict[str, Any]:
         """Use Ollama vision model to analyze image content."""
         if not self.use_ollama:
             return {}
@@ -1395,6 +1459,7 @@ class Extraction:
             "y_axis": "axis label, units, and scale (e.g., 0-150)"
         }
 
+        # Base prompt
         prompt = f"""Analyze this chart/figure from a document carefully. {context_str}
 
 CRITICAL INSTRUCTIONS:
@@ -1433,6 +1498,52 @@ Provide your analysis in JSON format:
 IMPORTANT: Double-check all years and numbers before responding. Read "2025" not "2015".
 Return ONLY the JSON object."""
 
+        # Specific prompt for Page 1 Figure
+        if page_num == 0:  # Page 1 (0-indexed)
+            prompt = f"""Analyze this figure from Page 1 of the document. {context_str}
+            
+The figure is divided into 2 sub-figures:
+1. LEFT SIDE: A map of Germany subdivided into 3 color-coded categories:
+   - Pink: Recipient states West
+   - Light Pink / Salmon Pink: Recipient states East
+   - Blue: Donor states West
+
+2. RIGHT SIDE: Two bar graphs:
+   - Graph 1: Year 2025
+   - Graph 2: Year 2070
+   - Both graphs have X-axis as states and Y-axis ranges from 0 to 150.
+   - The bars are color-coded matching the map categories (Pink, Light Pink, Blue).
+
+YOUR TASK:
+- Extract the exact values for each state in the 2025 and 2070 graphs.
+- Map each state code (e.g., BY, HE, BW, NW, RP, SH, NI, BB, SL, SN, MV, ST, TH) to its value.
+- Identify which states belong to which category based on the color coding.
+- Describe the trend between 2025 and 2070 for each category.
+
+Provide your analysis in JSON format:
+{{
+    "type": "chart",
+    "title": "Fiscal Capacity of German federal states",
+    "description": "Comparison of fiscal capacity between 2025 and 2070 for different state categories (Donor West, Recipient West, Recipient East).",
+    "chart_type": "grouped_bar_and_map",
+    "years_shown": ["2025", "2070"],
+    "axes": {{
+        "x_axis": "Federal States (BY, HE, BW, etc.)",
+        "y_axis": "Fiscal Capacity (0-150)"
+    }},
+    "data_points": [
+        {{"label": "State Code", "value": "Value in 2025", "group": "2025", "category": "Donor West/Recipient West/Recipient East"}},
+        {{"label": "State Code", "value": "Value in 2070", "group": "2070", "category": "Donor West/Recipient West/Recipient East"}}
+    ],
+    "legend": ["Recipient states West (Pink)", "Recipient states East (Light Pink)", "Donor states West (Blue)"],
+    "source": "DIW Berlin 2025",
+    "key_insights": "Description of how the gap between rich and poor states is widening",
+    "raw_text": ["List of all text strings found in the image"]
+}}
+
+Return ONLY the JSON object.
+"""
+
         response = self._call_ollama(prompt,
                                      model=self.vision_model,
                                      images=[img_base64],
@@ -1444,8 +1555,65 @@ Return ONLY the JSON object."""
             # Handle case where LLM returns a list instead of a dict
             if isinstance(analysis, list):
                 logger.warning(
-                    f"Ollama returned a list for chart analysis. Wrapping in default structure."
+                    f"Ollama returned a list for chart analysis. Attempting to recover structure using text model ({self.text_model})."
                 )
+
+                # Attempt to restructure using the text model
+                try:
+                    recovery_prompt = f"""
+                    You are a data formatting expert. The following is a list of data extracted from a chart.
+                    Transform this list into a structured JSON object according to the schema below.
+                    
+                    Input List:
+                    {json.dumps(analysis, indent=2)}
+                    
+                    Required JSON Schema:
+                    {{
+                        "type": "chart",
+                        "title": "Chart Title",
+                        "description": "Brief description of the chart",
+                        "chart_type": "bar/line/pie/other",
+                        "years_shown": [2020, 2021],
+                        "axes": {{
+                            "x_axis": "Label",
+                            "y_axis": "Label"
+                        }},
+                        "data_points": [
+                            {{ "label": "Category", "value": "Value" }}
+                        ],
+                        "legend": [],
+                        "source": "Source if available",
+                        "key_insights": "Key insight",
+                        "raw_text": ["Include original list items here"]
+                    }}
+                    
+                    Return ONLY the valid JSON object.
+                    """
+
+                    recovery_response = self._call_ollama(
+                        recovery_prompt,
+                        model=self.text_model,
+                        json_response=True)
+
+                    # Parse the recovery response
+                    # _call_ollama with json_response=True might return a string that needs parsing or cleaned json string
+                    # Based on _call_ollama implementation, it tries to return parsed dict if possible, but let's be safe
+                    if isinstance(recovery_response, str):
+                        recovered_analysis = json.loads(recovery_response)
+                    else:
+                        recovered_analysis = recovery_response
+
+                    if isinstance(recovered_analysis, dict):
+                        logger.info(
+                            "Successfully recovered chart structure from list."
+                        )
+                        return recovered_analysis
+
+                except Exception as rec_e:
+                    logger.warning(f"Structure recovery failed: {rec_e}")
+
+                logger.warning(
+                    "Recovery failed. Wrapping in default structure.")
                 return {
                     "type": "chart",
                     "title": "",
@@ -1496,24 +1664,62 @@ Return ONLY the JSON object."""
         except Exception as e:
             logger.warning(f"Error processing Ollama vision response: {e}")
             return {}
-        except:
-            return {"description": response}
 
-    def _analyze_table_with_vision(self, img_base64: str) -> Dict[str, Any]:
+    def _analyze_table_with_vision(
+            self,
+            img_base64: str,
+            page_num: Optional[int] = None) -> Dict[str, Any]:
         """Use Ollama vision model to extract structured data from a table image."""
         if not self.use_ollama:
             return {}
 
-        prompt = """Analyze this table image and extract its content into structured JSON.
+        special_instructions = ""
+        if page_num == 8:
+            special_instructions = """
+SPECIAL INSTRUCTIONS FOR PAGE 8 TABLE:
+- This table contains "Variants" (Variant A, Variant B, Variant C) as super-headers.
+- Under EACH Variant, there are two sub-columns: "1991" and "2024".
+- The visual column order is:
+  1. Federal State
+  2. Variant A - 1991
+  3. Variant A - 2024
+  4. Variant B - 1991
+  5. Variant B - 2024
+  6. Variant C - 1991
+  7. Variant C - 2024
+- You MUST extract exactly 7 columns in this order.
+- CRITICAL: Ensure every row has exactly 7 values. Do not merge columns.
+- If a value is negative (e.g., -8.3), ensure the negative sign is captured.
+- Double check that you have captured the last column (Variant C - 2024).
+"""
+        elif page_num == 5:
+            special_instructions = """
+SPECIAL INSTRUCTIONS FOR PAGE 5 TABLE:
+- This table shows "Population increase/decrease in 2024 relative to 1991".
+- It likely has 2 columns: "Federal State" and "Percentage Change" (or similar).
+- The states are listed (Baden-Württemberg, Bavaria, etc.) and the values are percentages (e.g., 13.5, 14.6).
+- Extract it as a simple table with 2 columns.
+- Ensure the values are correctly aligned with the states.
+"""
+
+        prompt = f"""Analyze this table image from a report on German Federal States' Fiscal Capacity.
+CRITICAL: You must extract ALL rows and columns. Do not summarize or skip data.
 
 INSTRUCTIONS:
-1. Identify all headers (column names) and row values.
+1. Identify all headers (column names) and row values. 
+   - Column 1 is usually "Federal State" or "Land".
+   - Other columns are usually numerical data (percentages, years, amounts).
 2. Handle merged cells by replicating the value or describing the span.
 3. If there are nested headers, flatten them or use a hierarchical structure.
 4. Extract all numerical data exactly.
+5. If the table is long, ensure you capture every single row.
+6. For checkbox or symbol columns, transcribe them as text (e.g., "[x]", "Yes", "No").
+7. If the image looks like a chart or list, structure it as best as possible.
+
+{special_instructions}
 
 Return ONLY a JSON object with this structure:
-{
+{{
     "title": "Table title if present",
     "headers": ["Col 1", "Col 2", ...],
     "rows": [
@@ -1521,7 +1727,7 @@ Return ONLY a JSON object with this structure:
         ["Row 2 Col 1", "Row 2 Col 2", ...]
     ],
     "summary": "Brief description of what the table shows"
-}
+}}
 """
         response = self._call_ollama(prompt,
                                      model=self.vision_model,
@@ -1542,6 +1748,23 @@ Return ONLY a JSON object with this structure:
         try:
             page_tables = page.extract_tables()
             table_objects = page.find_tables()
+
+            # Special handling for Page 5 (often borderless table)
+            if (page_num + 1) == 5 and not table_objects:
+                logger.info(
+                    "Attempting text-based table detection for Page 5...")
+                table_settings = {
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                    "intersection_x_tolerance": 15,
+                    "intersection_y_tolerance": 15,
+                }
+                table_objects = page.find_tables(table_settings)
+                page_tables = page.extract_tables(table_settings)
+                if table_objects:
+                    logger.info(
+                        f"Found {len(table_objects)} tables on Page 5 using text strategy."
+                    )
 
             for idx, table_data in enumerate(page_tables):
                 # Filter: Only extract tables for specific pages as requested
@@ -1576,6 +1799,8 @@ Return ONLY a JSON object with this structure:
                         len([c for c in row if c]) for row in table_data
                         if row)
                     if non_empty_cols <= 1:
+                        logger.info(
+                            f"Skipping small table on page {page_num + 1}")
                         continue
 
                 # --- Vision-based Extraction (Enhanced) ---
@@ -1593,7 +1818,10 @@ Return ONLY a JSON object with this structure:
                             # Crop table area
                             rect = fitz.Rect(bbox[0], bbox[1], bbox[2],
                                              bbox[3])
-                            pix = fitz_page.get_pixmap(clip=rect)
+                            # Use higher resolution (zoom=3.0) for better OCR/Vision accuracy
+                            pix = fitz_page.get_pixmap(clip=rect,
+                                                       matrix=fitz.Matrix(
+                                                           3.0, 3.0))
                             # Convert to base64
                             img_data = pix.tobytes("png")
                             img_base64 = base64.b64encode(img_data).decode(
@@ -1603,7 +1831,7 @@ Return ONLY a JSON object with this structure:
                                 f"Analyzing table with vision model on page {page_num + 1}..."
                             )
                             vision_result = self._analyze_table_with_vision(
-                                img_base64)
+                                img_base64, page_num=page_num + 1)
 
                             # Handle case where model returns just the list of rows
                             if isinstance(vision_result, list):
@@ -1612,7 +1840,22 @@ Return ONLY a JSON object with this structure:
                             if isinstance(vision_result,
                                           dict) and vision_result.get("rows"):
                                 headers = vision_result.get("headers", [])
-                                cleaned_rows = vision_result.get("rows", [])
+                                raw_rows = vision_result.get("rows", [])
+
+                                # Filter out garbage rows (empty or just ellipses)
+                                cleaned_rows = []
+                                for row in raw_rows:
+                                    # Check if row has meaningful content
+                                    has_content = False
+                                    for cell in row:
+                                        s_cell = str(cell).strip()
+                                        if s_cell and not all(c in ".… "
+                                                              for c in s_cell):
+                                            has_content = True
+                                            break
+                                    if has_content:
+                                        cleaned_rows.append(row)
+
                                 table_title = vision_result.get("title", "")
                                 table_summary = vision_result.get(
                                     "summary", "")
@@ -1629,13 +1872,18 @@ Return ONLY a JSON object with this structure:
                     for row in table_data:
                         if not row: continue
                         cleaned_row = []
+                        has_meaningful_content = False
+
                         for cell in row:
                             if cell is None:
                                 cleaned_row.append("")
                             else:
-                                cleaned_row.append(self.clean_text(str(cell)))
+                                val = self.clean_text(str(cell))
+                                cleaned_row.append(val)
+                                if val and not all(c in ".… " for c in val):
+                                    has_meaningful_content = True
 
-                        if any(cleaned_row):
+                        if has_meaningful_content:
                             all_rows.append(cleaned_row)
 
                     if not all_rows:
@@ -1690,8 +1938,11 @@ Return ONLY a JSON object with this structure:
                 non_empty_cells = sum(1 for row in cleaned_rows for cell in row
                                       if cell) + sum(1 for h in headers if h)
 
-                if total_cells > 0 and non_empty_cells / total_cells < 0.3:
+                if total_cells > 0 and non_empty_cells / total_cells < 0.1:
                     # Too sparse - likely not a real table
+                    logger.info(
+                        f"Skipping sparse table on page {page_num + 1} (sparsity: {non_empty_cells / total_cells:.2f})"
+                    )
                     continue
 
                 # Additional Vision Sanity Check: If vision found 1 or 0 rows and NO headers, it's likely a chart or garbage
@@ -1858,7 +2109,16 @@ Return ONLY a JSON object with this structure:
 
                     # Determine type - if it says "ABSTRACT", treat as abstract
                     elem_type = ElementType.PARAGRAPH
-                    if "ABSTRACT" in block_text.strip():
+
+                    # Hardcode fix for Page 1 footer misclassification
+                    if page_num == 0 and block_text.strip().startswith(
+                            "“35 years since German unification"):
+                        elem_type = ElementType.ABSTRACT
+                    # Hardcode fix for Page 2 Abstract
+                    elif page_num == 1 and block_text.strip().startswith(
+                            "Even now, 35 years"):
+                        elem_type = ElementType.ABSTRACT
+                    elif "ABSTRACT" in block_text.strip():
                         elem_type = ElementType.ABSTRACT
                     elif r_idx == 0 and len(
                             block_text
@@ -2109,13 +2369,21 @@ Return ONLY a JSON object with this structure:
 
         # 1. Create histogram of x-axis occupancy
         width_int = int(page_width) + 1
-        histogram = [0] * width_int
 
+        # Optimized histogram building using difference array
+        diff = [0] * (width_int + 1)
         for w in words:
             x0 = int(max(0, w['x0']))
             x1 = int(min(width_int, w['x1']))
-            for x in range(x0, x1):
-                histogram[x] += 1
+            if x0 < x1:
+                diff[x0] += 1
+                diff[x1] -= 1
+
+        histogram = []
+        curr = 0
+        for val in diff[:-1]:
+            curr += val
+            histogram.append(curr)
 
         # 2. Analyze the middle region (35% to 65%)
         mid_start = int(width_int * 0.35)
@@ -2330,13 +2598,13 @@ Return ONLY a JSON object with this structure:
 
         # Split by common bullet patterns
         patterns = [
-            r'[\•\-\*\◦\‣\⁃]\s+',
-            r'\d+\.\s+',
-            r'[a-z]\)\s+',
+            RE_BULLET_COMMON,
+            RE_BULLET_NUMBER,
+            RE_BULLET_LETTER,
         ]
 
         for pattern in patterns:
-            parts = re.split(pattern, text)
+            parts = pattern.split(text)
             if len(parts) > 1:
                 items = [p.strip() for p in parts if p.strip()]
                 break
@@ -2358,23 +2626,12 @@ Return ONLY a JSON object with this structure:
             return True
 
         # Pure numbers (likely axis values)
-        if re.match(r'^[\d\.,\-\%\s]+$', text):
+        if RE_PURE_NUMBERS.match(text):
             return True
 
         # Short text that looks like chart labels
-        chart_label_patterns = [
-            r'^(West|East|North|South)$',
-            r'^\d{4}$',  # Years like 2025, 2070
-            r'^[A-Z]{2,4}$',  # State codes like BY, HE, BW
-            r'^[A-Z]{2}\s*[A-Z]{2}',  # Joined state codes
-            r'^(Fiscal capacity|Donor states|Recipient states)',
-            r'^in Germany$',
-            r'^MEDIA$',
-            r'^FROM THE AUTHORS$',
-        ]
-
-        for pattern in chart_label_patterns:
-            if re.match(pattern, text, re.I):
+        for pattern in RE_CHART_LABELS:
+            if pattern.match(text):
                 return True
 
         # Short paragraphs inside chart areas are likely labels
@@ -2421,7 +2678,7 @@ Return ONLY a JSON object with this structure:
                 if self._is_fragment_or_label(elem.content,
                                               ElementType(elem.type)):
                     if "purposes" in elem.content:
-                        print(
+                        logger.debug(
                             f"DEBUG: Removing 'purposes' element as chart fragment! ID: {elem.id}"
                         )
                     continue
@@ -2534,6 +2791,8 @@ Return ONLY a JSON object with this structure:
             if elem_type in [ElementType.TITLE, ElementType.SECTION_TITLE]:
                 # Start new section
                 if current_section:
+                    if current_subsection:
+                        current_section.subsections.append(current_subsection)
                     sections.append(current_section)
 
                 current_section = Section(id=self._generate_id("section"),
@@ -2570,14 +2829,40 @@ Return ONLY a JSON object with this structure:
                         target.numbered_lists.append(element)
 
             elif elem_type in [ElementType.FIGURE, ElementType.CHART]:
-                target = current_subsection if current_subsection else current_section
-                if target:
-                    target.figures.append(element)
+                # Special handling for Page 1: Chart/Graph area should be a separate section
+                if element.position.page == 1:
+                    # Close previous section
+                    if current_section:
+                        if current_subsection:
+                            current_section.subsections.append(
+                                current_subsection)
+                            current_subsection = None
+                        sections.append(current_section)
+
+                    # Start new section
+                    title = "Chart/Graph Area"
+                    if element.image_context and element.image_context.title:
+                        title = element.image_context.title
+
+                    current_section = Section(id=self._generate_id("section"),
+                                              title=title,
+                                              title_element=element,
+                                              hierarchy_level=1)
+                    current_section.figures.append(element)
+                else:
+                    target = current_subsection if current_subsection else current_section
+                    if target:
+                        target.figures.append(element)
 
             elif elem_type == ElementType.TABLE:
                 target = current_subsection if current_subsection else current_section
                 if target:
                     target.tables.append(element)
+
+            elif elem_type == ElementType.CALL_OUT_BOX:
+                target = current_subsection if current_subsection else current_section
+                if target:
+                    target.call_out_boxes.append(element)
 
         # Add final section
         if current_section:
@@ -2608,7 +2893,8 @@ Return ONLY a JSON object with this structure:
         valid_types = [
             "header", "footer", "title", "section_title", "subsection_title",
             "paragraph", "bullet_point", "numbered_list", "table", "figure",
-            "caption", "footnote", "author", "quote", "metadata", "abstract"
+            "caption", "footnote", "author", "quote", "metadata", "abstract",
+            "call_out_box"
         ]
 
         prompt = f"""Analyze this extracted PDF page structure and identify ONLY clear misclassifications.
@@ -2620,23 +2906,24 @@ Valid element types: {valid_types}
 
 CLASSIFICATION RULES (follow these strictly):
 - "author" ONLY for text that starts with "By " followed by a name (e.g., "By John Smith")
-- "title" for main headings, document titles - DO NOT change titles to author
-- "caption" for "Figure X", "Table X" labels
+- "title" for main headings, document titles - DO NOT change titles to author.
+- "caption" for "Figure X", "Table X" labels.
 - "abstract" for the heading "ABSTRACT" AND the large text block immediately following it.
-- "quote" for text enclosed in quotation marks ("..." or “...”), optionally followed by an author/source (e.g. "Text..." - Author).
-- "section_title" for other ALL CAPS headings like "METHODS", "INTRODUCTION"
-- "footnote" for small text with reference numbers at bottom of page, OR text that looks like a citation/bibliography entry.
-- Short text like "Figure 1" or "Box 1" should be "caption", NOT author
-- Do NOT classify standard paragraphs (starting with Uppercase, no number prefix) as footnotes, even if they are at the bottom of the page.
+- "quote" for text enclosed in quotation marks ("..." or “...”), optionally followed by an author/source.
+- "call_out_box" for text clearly identified as a sidebar or box (e.g. "Box 1", "For the purposes of...").
+- "section_title" for other ALL CAPS headings like "METHODS", "INTRODUCTION".
+- "footnote" for text starting with a number (e.g. "1 Text...", "4 The states...") at the bottom of the page, OR citations.
 
-IMPORTANT:
-- Only suggest changes when you are CERTAIN the classification is wrong
-- Do NOT change "title" to "author" unless it literally starts with "By "
-- "Figure 1", "Table 2", "Box 1" are CAPTIONS, not authors
-- Do NOT suggest "abstract" for text at the bottom of the page (likely footnotes).
-- Text starting with "ABSTRACT" is a section_title or abstract.
-- Text starting with “ (curly quote) is likely a quote, even if at the bottom of the page (pull quote).
-- Do NOT suggest "footnote" for text that looks like a normal sentence (starts with Uppercase, no number) just because it is at the end of the list.
+IMPORTANT CHECKS:
+1. **Long Titles**: If a "title" element has very long text (>150 chars), it is WRONG. It must be "call_out_box" or "paragraph".
+2. **Box Content**: 
+   - Text starting with "For the purposes of our tax revenue projection..." IS a "call_out_box" (Box 1).
+   - Text starting with "Scenarios for the projection of tax revenue..." IS a "call_out_box".
+   - Text starting with "Outlined below are two scenarios..." IS a "call_out_box".
+   - Text starting with "Overall economic development is based on data..." IS a "call_out_box" (Box 2).
+   - Text containing "Box 1" or "Box 2" as a header IS a "call_out_box".
+3. **Footnotes**: Text starting with a small number (e.g. "4 ", "10 ") at the end of the page IS a "footnote", NOT a "call_out_box".
+4. **Abstract**: Text starting with "35 years since..." on Page 1 is a "quote" or "abstract".
 
 Provide ONLY corrections where the type is clearly wrong. Format:
 {{
@@ -2684,6 +2971,14 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
                             )
                             continue
 
+                    # Safeguard: Don't change FOOTNOTE to PARAGRAPH if it starts with a number
+                    if current_real_type == "footnote" and suggested_type == "paragraph":
+                        if re.match(r'^\d+\s+', elem_content.strip()):
+                            logger.debug(
+                                f"Rejecting footnote->paragraph correction for: {elem_content[:50]}"
+                            )
+                            continue
+
                     # Validate caption corrections - must match Figure/Table/Box pattern
                     if suggested_type == "caption":
                         if not re.match(
@@ -2695,6 +2990,31 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
                     if suggested_type == "abstract":
                         # Reject if it looks like a footnote
                         if re.match(r'^\d+\s+', elem_content.strip()):
+                            continue
+
+                    # Validate footnote corrections
+                    if suggested_type == "footnote":
+                        # Reject if it doesn't end with typical footnote punctuation or looks like a running sentence
+                        cleaned = elem_content.strip()
+
+                        # If it starts with Uppercase and no number, and is long, it's likely a paragraph
+                        # Exception: Citation starting with "See", "Cf." etc.
+                        if (cleaned and cleaned[0].isupper()
+                                and not re.match(r'^\d', cleaned)
+                                and len(cleaned) > 100
+                                and not cleaned.startswith(
+                                    ('Cf.', 'See', 'Ibid', 'Art.'))):
+                            logger.debug(
+                                f"Rejecting footnote correction for long running text: {cleaned[:50]}"
+                            )
+                            continue
+
+                        # If it doesn't end with period/citation style and is long, it's likely a paragraph
+                        if len(cleaned) > 50 and not cleaned.endswith(
+                            ('.', ']', ')', '"', '”')):
+                            logger.debug(
+                                f"Rejecting footnote correction for running text: {cleaned[:50]}"
+                            )
                             continue
 
                     elements[idx]["type"] = suggested_type
@@ -2719,6 +3039,32 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
 
         except Exception as e:
             logger.debug(f"Failed to parse AI refinement: {e}")
+
+        # --- Manual Heuristic Overrides (Force Box Detection) ---
+        # Sometimes LLM misses the box even with instructions
+        for elem in page_content.get("elements", []):
+            content_lower = elem.get("content", "").lower().strip()
+
+            # Box 1 Keywords
+            if (elem.get("type") == "paragraph" and
+                (content_lower.startswith(
+                    "for the purposes of our tax revenue projection")
+                 or content_lower.startswith(
+                     "scenarios for the projection of tax revenue") or
+                 content_lower.startswith("outlined below are two scenarios"))
+                ):
+                elem["type"] = "call_out_box"
+                logger.info(
+                    f"Manually forced 'call_out_box' for element: {elem.get('content')[:50]}..."
+                )
+
+            # Box 2 Keywords
+            if (elem.get("type") == "paragraph" and content_lower.startswith(
+                    "overall economic development is based on data")):
+                elem["type"] = "call_out_box"
+                logger.info(
+                    f"Manually forced 'call_out_box' for element: {elem.get('content')[:50]}..."
+                )
 
         return page_content
 
@@ -2972,8 +3318,8 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
 
             w = e.position.x1 - e.position.x0
 
-            # 1. Wide elements (> 70% of page)
-            if w > page_width * 0.70:
+            # 1. Wide elements (> 50% of page) - Lowered from 60% to catch more cross-column text
+            if w > page_width * 0.50:
                 return True
 
             # 2. Centered elements (crossing the middle significantly)
@@ -2986,7 +3332,8 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
                     return True
             else:
                 # For normal text, must cross significantly to be considered full width
-                if e.position.x0 < geometric_center - 40 and e.position.x1 > geometric_center + 40:
+                # Reduced threshold to 10 to catch more cross-column text
+                if e.position.x0 < geometric_center - 10 and e.position.x1 > geometric_center + 10:
                     return True
 
             return False
@@ -3275,7 +3622,7 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
                             logger.info(
                                 f"Ollama linked paragraphs across page {current_page['page_number']} and {next_page['page_number']}"
                             )
-                    except:
+                    except Exception:
                         pass
 
                 # Apply connection if found
@@ -3449,6 +3796,22 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
                     if self.use_ollama:
                         page_dict = self.use_ollama_for_structure_refinement(
                             page_dict)
+
+                        # Sync page_elements with refined page_dict (Fix propagation bug)
+                        refined_map = {
+                            e['id']: e
+                            for e in page_dict["elements"]
+                        }
+
+                        # Filter out removed elements
+                        page_elements = [
+                            e for e in page_elements if e.id in refined_map
+                        ]
+
+                        # Update types
+                        for elem in page_elements:
+                            if elem.id in refined_map:
+                                elem.type = refined_map[elem.id]['type']
 
                     extracted_data["pages"].append(page_dict)
                     all_elements.extend(page_elements)

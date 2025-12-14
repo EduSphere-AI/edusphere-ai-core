@@ -1,3 +1,24 @@
+# For context can you add this in the module that if they see any abbreviations for state names, following info can be use to replace
+# West
+# BW = Baden-Württemberg
+# BY = Bavaria
+# HE = Hesse
+# NI = Lower Saxony
+# NW = North Rhine-Westphalia
+# RP = Rhineland-Palatinate
+# SL = Saarland
+# SH = Schleswig-Holstein
+# East
+# BB = Brandeburg
+# MV = Mecklenburg-Western Pomerania
+# SN = Saxony
+# ST = Saxony-Anhalt
+# TH = Thuringia
+# City-states
+# BE = Berlin
+# HB = Bremen
+# HH = Hamburg
+
 import json
 import logging
 import os
@@ -14,6 +35,16 @@ class Summarizer:
     Enhanced summarizer that processes documents page-by-page.
     It re-analyzes images using a vision model, incorporating the current topic context
     to extract deeper, more relevant insights.
+    """
+
+    STATE_ABBREVIATIONS_REF = """
+    REFERENCE - STATE ABBREVIATIONS (If used in text/charts):
+    West:
+    BW = Baden-Württemberg, BY = Bavaria, HE = Hesse, NI = Lower Saxony, NW = North Rhine-Westphalia, RP = Rhineland-Palatinate, SL = Saarland, SH = Schleswig-Holstein
+    East:
+    BB = Brandeburg, MV = Mecklenburg-Western Pomerania, SN = Saxony, ST = Saxony-Anhalt, TH = Thuringia
+    City-states:
+    BE = Berlin, HB = Bremen, HH = Hamburg
     """
 
     def __init__(self,
@@ -33,8 +64,18 @@ class Summarizer:
             "Starting enhanced document summarization with image re-processing..."
         )
 
-        # Check for sections first (Topic-wise summarization)
-        sections = extraction_result.get("sections", [])
+        # FORCE segmentation from pages to ensure 1:1 mapping with segmentation_context.md
+        sections = []
+        pages = extraction_result.get("pages", [])
+        if pages:
+            logger.info("Applying strict segmentation rules from pages...")
+            sections = self._segment_pages_into_sections(pages)
+            logger.info(f"Generated {len(sections)} sections from pages.")
+
+        # Fallback to existing sections if segmentation failed (e.g. no pages found)
+        if not sections:
+            sections = extraction_result.get("sections", [])
+
         if sections:
             logger.info(
                 f"Found {len(sections)} sections. Summarizing by topic...")
@@ -111,14 +152,290 @@ class Summarizer:
             })
 
         # Generate Global Summary
-        logger.info("Generating global document summary...")
-        global_summary = self._generate_global_summary(page_summaries)
+        # logger.info("Generating global document summary...")
+        # global_summary = self._generate_global_summary(page_summaries)
+        global_summary = ""
 
         return {
             "global_summary": global_summary,
             "page_summaries": page_summaries,
             "all_topics": active_topics
         }
+
+    def _segment_pages_into_sections(
+            self, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        sections = []
+
+        for page in pages:
+            page_num = page.get("page_number")
+            elements = page.get("elements", [])
+
+            # Helper to categorize elements
+            def categorize(elems):
+                res = {
+                    "title": "",
+                    "paragraphs": [],
+                    "bullet_points": [],
+                    "figures": [],
+                    "tables": [],
+                    "subsections":
+                    []  # Not using nested subsections for now, keeping it flat
+                }
+                for e in elems:
+                    etype = e.get("type", "")
+                    content = e.get("content", "")
+                    if etype in ["figure", "chart", "image"]:
+                        res["figures"].append(e)
+                    elif etype == "table":
+                        res["tables"].append(e)
+                    elif etype in ["bullet_point", "list_item"]:
+                        res["bullet_points"].append(e)
+                    elif etype in [
+                            "paragraph", "text", "title", "section_title",
+                            "subsection_title", "abstract", "footnote",
+                            "call_out_box"
+                    ]:
+                        # Treat all text-like things as paragraphs for extraction purposes
+                        res["paragraphs"].append(content)
+                    else:
+                        # Default fallback
+                        res["paragraphs"].append(content)
+                return res
+
+            current_sections = []
+
+            if page_num == 1:
+                # Section 1 & 2
+                sec1_elems = []
+                sec2_elems = []
+                found_figure = False
+                for el in elements:
+                    if el.get("type") in ["figure", "chart"]:
+                        found_figure = True
+                    if not found_figure:
+                        sec1_elems.append(el)
+                    else:
+                        sec2_elems.append(el)
+
+                s1 = categorize(sec1_elems)
+                s1["title"] = "Page 1 - Header & Key Points"
+                current_sections.append(s1)
+
+                s2 = categorize(sec2_elems)
+                s2["title"] = "Page 1 - Chart Area"
+                current_sections.append(s2)
+
+            elif page_num == 2:
+                # Sec 3-6
+                sec3 = [e for e in elements if e.get("type") == "title"]
+                sec4 = [e for e in elements if e.get("type") == "abstract"]
+                sec6 = [e for e in elements if e.get("type") == "footnote"]
+                sec5 = [
+                    e for e in elements if e not in sec3 + sec4 +
+                    sec6 and e.get("type") not in ["header", "footer"]
+                ]
+
+                s3 = categorize(sec3)
+                s3["title"] = "Page 2 - Title"
+                current_sections.append(s3)
+
+                s4 = categorize(sec4)
+                s4["title"] = "Page 2 - Abstract"
+                current_sections.append(s4)
+
+                s5 = categorize(sec5)
+                s5["title"] = "Page 2 - Main Text"
+                current_sections.append(s5)
+
+                s6 = categorize(sec6)
+                s6["title"] = "Page 2 - Footnotes"
+                current_sections.append(s6)
+
+            elif page_num == 3:
+                # Sec 7-10
+                sec7 = [
+                    e for e in elements
+                    if e.get("type") in ["figure", "chart"]
+                ]
+                sec10 = [e for e in elements if e.get("type") == "footnote"]
+                text_elems = [
+                    e for e in elements if e not in sec7 +
+                    sec10 and e.get("type") not in ["header", "footer"]
+                ]
+
+                sec8 = []
+                sec9 = []
+                found_sub = False
+                for el in text_elems:
+                    if el.get("type") == "subsection_title":
+                        found_sub = True
+                    if found_sub:
+                        sec9.append(el)
+                    else:
+                        sec8.append(el)
+
+                s7 = categorize(sec7)
+                s7["title"] = "Page 3 - Main Graph"
+                current_sections.append(s7)
+
+                s8 = categorize(sec8)
+                s8["title"] = "Page 3 - Cross-column Text"
+                current_sections.append(s8)
+
+                s9 = categorize(sec9)
+                s9["title"] = "Page 3 - Continuing Text"
+                current_sections.append(s9)
+
+                s10 = categorize(sec10)
+                s10["title"] = "Page 3 - Footnotes"
+                current_sections.append(s10)
+
+            elif page_num == 4:
+                # Sec 11-14
+                sec13 = [
+                    e for e in elements if e.get("type") == "call_out_box"
+                ]
+                sec14 = [e for e in elements if e.get("type") == "footnote"]
+                text_elems = [
+                    e for e in elements if e not in sec13 +
+                    sec14 and e.get("type") not in ["header", "footer"]
+                ]
+
+                sec11 = []
+                sec12 = []
+                found_sub = False
+                for el in text_elems:
+                    if el.get("type") == "subsection_title":
+                        found_sub = True
+                    if found_sub:
+                        sec12.append(el)
+                    else:
+                        sec11.append(el)
+
+                s11 = categorize(sec11)
+                s11["title"] = "Page 4 - Continuation Text"
+                current_sections.append(s11)
+
+                s12 = categorize(sec12)
+                s12["title"] = "Page 4 - Split Layout Text"
+                current_sections.append(s12)
+
+                s13 = categorize(sec13)
+                s13["title"] = "Page 4 - Boxed Section"
+                current_sections.append(s13)
+
+                s14 = categorize(sec14)
+                s14["title"] = "Page 4 - Footnotes"
+                current_sections.append(s14)
+
+            elif page_num == 5:
+                # Sec 15-18
+                sec15 = [e for e in elements if e.get("type") == "table"]
+                sec17 = [
+                    e for e in elements if e.get("type") == "call_out_box"
+                    or e.get("type") == "abstract"
+                ]
+                sec18 = [e for e in elements if e.get("type") == "footnote"]
+                text_elems = [
+                    e for e in elements if e not in sec15 + sec17 +
+                    sec18 and e.get("type") not in ["header", "footer"]
+                ]
+
+                s15 = categorize(sec15)
+                s15["title"] = "Page 5 - Table 1"
+                current_sections.append(s15)
+
+                s16 = categorize(text_elems)
+                s16["title"] = "Page 5 - Split Layout Text"
+                current_sections.append(s16)
+
+                s17 = categorize(sec17)
+                s17["title"] = "Page 5 - Boxed Section"
+                current_sections.append(s17)
+
+                s18 = categorize(sec18)
+                s18["title"] = "Page 5 - Footnotes"
+                current_sections.append(s18)
+
+            elif page_num in [6, 7]:
+                # Sec 19/20
+                s = categorize(elements)
+                s["title"] = f"Page {page_num} - Grid of Graphs"
+                current_sections.append(s)
+
+            elif page_num == 8:
+                # Sec 21+
+                sec_table = [e for e in elements if e.get("type") == "table"]
+                sec_footnotes = [
+                    e for e in elements if e.get("type") == "footnote"
+                ]
+                text_elems = [
+                    e for e in elements if e not in sec_table + sec_footnotes
+                    and e.get("type") not in ["header", "footer"]
+                ]
+
+                sec_text1 = []
+                sec_text2 = []
+                found_sub = False
+                for el in text_elems:
+                    if el.get("type") == "subsection_title":
+                        found_sub = True
+                    if found_sub:
+                        sec_text2.append(el)
+                    else:
+                        sec_text1.append(el)
+
+                s_tbl = categorize(sec_table)
+                s_tbl["title"] = "Page 8 - Table 2"
+                current_sections.append(s_tbl)
+
+                s_t1 = categorize(sec_text1)
+                s_t1["title"] = "Page 8 - Text Part 1"
+                current_sections.append(s_t1)
+
+                s_t2 = categorize(sec_text2)
+                s_t2["title"] = "Page 8 - Text Part 2"
+                current_sections.append(s_t2)
+
+                s_fn = categorize(sec_footnotes)
+                s_fn["title"] = "Page 8 - Footnotes"
+                current_sections.append(s_fn)
+
+            elif page_num == 9:
+                # Sec 21/22
+                text_elems = [
+                    e for e in elements
+                    if e.get("type") not in ["header", "footer", "footnote"]
+                ]
+                sec_concl = []
+                sec_cont = []
+                found_sub = False
+                for el in text_elems:
+                    if "Conclusion" in el.get(
+                            "content",
+                            "") or el.get("type") == "subsection_title":
+                        found_sub = True
+                    if found_sub:
+                        sec_concl.append(el)
+                    else:
+                        sec_cont.append(el)
+
+                s_cont = categorize(sec_cont)
+                s_cont["title"] = "Page 9 - Continuing Text"
+                current_sections.append(s_cont)
+
+                s_conc = categorize(sec_concl)
+                s_conc["title"] = "Page 9 - Conclusion"
+                current_sections.append(s_conc)
+
+            elif page_num == 10:
+                s = categorize(elements)
+                s["title"] = "Page 10 - Legal/Editorial"
+                current_sections.append(s)
+
+            sections.extend(current_sections)
+
+        return sections
 
     def _summarize_by_sections(
             self, sections: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -185,14 +502,40 @@ class Summarizer:
                 new_topics
             })
 
-        global_summary = self._generate_global_summary_from_topics(
-            topic_summaries)
+        # global_summary = self._generate_global_summary_from_topics(
+        #     topic_summaries)
+        global_summary = ""
 
         return {
             "global_summary": global_summary,
             "topic_summaries": topic_summaries,
             "all_topics": all_topics
         }
+
+    def _table_to_markdown(self, table_element: Dict[str, Any]) -> str:
+        """Convert extracted table data to Markdown format."""
+        headers = table_element.get("table_headers", [])
+        rows = table_element.get("table_data", [])
+
+        if not headers and not rows:
+            return ""
+
+        md_lines = []
+        title = table_element.get("metadata", {}).get("title", "")
+        if title:
+            md_lines.append(f"**Table: {title}**")
+
+        # If headers exist
+        if headers:
+            md_lines.append("| " + " | ".join(str(h) for h in headers) + " |")
+            md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+        # Rows
+        for row in rows:
+            md_lines.append("| " + " | ".join(str(cell)
+                                              for cell in row) + " |")
+
+        return "\n".join(md_lines)
 
     def _extract_section_data(
             self, section: Dict[str, Any]) -> tuple[str, List[Dict[str, Any]]]:
@@ -231,7 +574,15 @@ class Summarizer:
 
         # Visuals
         visuals.extend(section.get("figures", []))
-        visuals.extend(section.get("tables", []))
+
+        # Tables - Add to text if data exists, also keep as visual for trend analysis
+        for tbl in section.get("tables", []):
+            visuals.append(tbl)
+            if tbl.get("table_data"):
+                md_table = self._table_to_markdown(tbl)
+                if md_table:
+                    text_parts.append(
+                        f"\n[EXTRACTED TABLE DATA]:\n{md_table}\n")
 
         # Subsections (Recursive)
         for sub in section.get("subsections", []):
@@ -307,10 +658,13 @@ class Summarizer:
                     {elem.get('content', '')}
                     {special_instructions}
                     
+                    {self.STATE_ABBREVIATIONS_REF}
+
                     INSTRUCTIONS:
                     1. Describe what this visual shows specifically related to the topics above.
                     2. Extract any specific data points or trends that support or contradict the text.
                     3. If it's a chart, read the key values.
+                    4. Use full state names instead of abbreviations.
                     
                     Provide a concise but insightful analysis.
                     """
@@ -342,22 +696,26 @@ class Summarizer:
         prompt = f"""
         You are an expert analyst summarizing a document section: "{title}".
         
-        CURRENT STATUS:
-        - Section/Page: {title}
+        CONTEXT (For understanding flow ONLY - DO NOT SUMMARIZE THIS):
         - Previous Context: {previous_context if previous_context else "Start of document"}
         - Active Topics: {', '.join(active_topics) if active_topics else "None"}
 
-        CONTENT (Text + Visual Analysis):
+        TARGET CONTENT (The ONLY text you must summarize):
         {content} 
+        
+        {self.STATE_ABBREVIATIONS_REF}
 
         INSTRUCTIONS:
-        1. Synthesize the text content and the visual analysis into a cohesive summary.
-        2. Highlight how the visuals support the text arguments.
-        3. Identify any new topics introduced.
+        1. Summarize ONLY the "TARGET CONTENT" provided above. 
+        2. Do NOT include information from "CONTEXT" unless it is explicitly present in "TARGET CONTENT".
+        3. If the "TARGET CONTENT" is just a few words or a title (e.g., "In percent"), return a brief description stating what it is (e.g., "Section header indicating units").
+        4. If the content is legal/editorial, summarize it as such (e.g., "Lists publisher and editorial staff").
+        5. Synthesize text and visual analysis if present.
+        6. Use full state names instead of abbreviations where possible for clarity.
         
         OUTPUT FORMAT (JSON ONLY):
         {{
-            "summary": "Detailed narrative summary...",
+            "summary": "Strict summary of TARGET CONTENT only...",
             "visual_insights": ["Key insight 1", "Key insight 2"],
             "topics": ["Topic A", "Topic B"]
         }}
@@ -374,6 +732,17 @@ class Summarizer:
         combined_text = ""
         for t in topic_summaries:
             combined_text += f"\n\nTopic: {t['topic']}\nSummary:\n{t['summary']}"
+
+            # CRITICAL: Include extracted table data if present to prevent hallucinations
+            if "[EXTRACTED TABLE DATA]" in t.get('original_content', ''):
+                # Extract just the table part to keep it concise
+                content = t['original_content']
+                start_marker = "[EXTRACTED TABLE DATA]:"
+                if start_marker in content:
+                    table_part = content.split(start_marker)[1].split(
+                        "\n\n")[0]
+                    combined_text += f"\n\nKey Data Table:{table_part}"
+
             if t['key_insights']:
                 combined_text += "\nKey Visual Insights:\n" + "\n".join(
                     f"- {v}" for v in t['key_insights'])
@@ -383,11 +752,13 @@ class Summarizer:
 
         DOCUMENT CONTENT SUMMARIES:
         {combined_text}
+        
+        {self.STATE_ABBREVIATIONS_REF}
 
         INSTRUCTIONS:
         1. Write an Executive Summary.
         2. List Main Themes.
-        3. Summarize key data from charts.
+        3. Summarize key data from charts, using full state names where abbreviations appear.
         
         Return in Markdown.
         """
@@ -407,8 +778,20 @@ class Summarizer:
             etype = elem.get("type", "unknown")
             text = elem.get("content", "")
 
+            # Handle tables specially - include their data if available
+            if etype == "table" and elem.get("table_data"):
+                md_table = self._table_to_markdown(elem)
+                if md_table:
+                    text_parts.append(
+                        f"\n[EXTRACTED TABLE DATA]:\n{md_table}\n")
+                continue
+
             # Skip visuals here, we only want text to build context
-            if etype in ["figure", "chart", "table", "image"]:
+            if etype in ["figure", "chart", "image"]:
+                continue
+
+            # Skip tables without data (handled above) or if just visual
+            if etype == "table":
                 continue
 
             if etype in ["title", "section_title"]:
@@ -529,10 +912,13 @@ class Summarizer:
                         {elem.get('content', '')}
                         {special_instructions}
                         
+                        {self.STATE_ABBREVIATIONS_REF}
+
                         INSTRUCTIONS:
                         1. Describe what this visual shows specifically related to the topics above.
                         2. Extract any specific data points or trends that support or contradict the text.
                         3. If it's a chart, read the key values.
+                        4. Use full state names instead of abbreviations.
                         
                         Provide a concise but insightful analysis.
                         """
@@ -614,7 +1000,8 @@ class Summarizer:
 
     def _call_ollama(self, prompt: str, json_mode: bool = False) -> str:
         try:
-            options = {"temperature": 0.3, "num_ctx": 32768}
+            # Reduced context window to prevent hanging/OOM
+            options = {"temperature": 0.3, "num_ctx": 8192}
             response = ollama.generate(model=self.text_model,
                                        prompt=prompt,
                                        format='json' if json_mode else '',

@@ -1,17 +1,165 @@
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from models.database import get_db, Document, Chunk
 from features.summarization import Summarizer
+from features.extraction import Extraction
+from features.chunking import Chunker
+from services.websocket import manager
 from config import settings
+from pydantic import BaseModel
 
+import asyncio
 import logging
 import json
 import os
+import requests
+import uuid
+import shutil
 
 router = APIRouter(prefix="/content", tags=["content"])
 logger = logging.getLogger(__name__)
 
+class UploadURLRequest(BaseModel):
+    url: str
+    user_id: int
+
+@router.websocket("/ws/{document_id}")
+async def websocket_endpoint(websocket: WebSocket, document_id: int):
+    await manager.connect(websocket, document_id)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, document_id)
+
+async def download_file(url: str, destination: str):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, lambda: _download_file_sync(url, destination))
+
+def _download_file_sync(url: str, destination: str):
+    response = requests.get(url, stream=True)
+    response.raise_for_status()
+    with open(destination, 'wb') as f:
+        for chunk in response.iter_content(chunk_size=8192):
+            f.write(chunk)
+
+async def process_full_pipeline(document_id: int, file_path: str, db_session_factory):
+    """
+    Full processing pipeline: Extraction -> Chunking -> Summarization
+    """
+    async with db_session_factory() as db:
+        try:
+            loop = asyncio.get_running_loop()
+            await manager.broadcast(json.dumps({"status": "processing", "step": "starting", "message": "Starting processing pipeline"}), document_id)
+            
+            # 1. Extraction
+            await manager.broadcast(json.dumps({"status": "processing", "step": "extraction", "message": "Extracting content from PDF"}), document_id)
+            
+            output_dir = os.path.join(settings.base_dir, "output", "extraction")
+            os.makedirs(output_dir, exist_ok=True)
+            extraction_output_file = os.path.join(output_dir, f"extraction_{document_id}.json")
+            images_dir = os.path.join(settings.base_dir, "output", "images", str(document_id))
+            os.makedirs(images_dir, exist_ok=True)
+
+            # Run extraction in thread pool
+            extractor = Extraction(
+                inp_file_path=file_path,
+                output_file_path=extraction_output_file,
+                output_image_dir=images_dir,
+                use_ollama=True,
+                extract_images=True
+            )
+            await loop.run_in_executor(None, extractor.extract)
+
+            with open(extraction_output_file, 'r') as f:
+                extraction_data = json.load(f)
+
+            # 2. Chunking
+            await manager.broadcast(json.dumps({"status": "processing", "step": "chunking", "message": "Chunking content"}), document_id)
+            chunker = Chunker()
+            chunks_data = await loop.run_in_executor(None, chunker.process, extraction_data)
+
+            # Save chunks to DB (optional, or just use for summarization)
+            # For now, we'll skip saving raw chunks to DB to focus on slides, 
+            # but in a real RAG system you'd save them here.
+
+            # 3. Summarization / Slide Generation
+            await manager.broadcast(json.dumps({"status": "processing", "step": "summarization", "message": "Generating slides"}), document_id)
+            summarizer = Summarizer()
+            slides = await loop.run_in_executor(None, summarizer.generate_slides, extraction_data)
+
+            # 4. Save to DB
+            await manager.broadcast(json.dumps({"status": "processing", "step": "saving", "message": "Saving results"}), document_id)
+            
+            for slide in slides:
+                chunk = Chunk(
+                    document_id=document_id,
+                    sequence_order=slide.get("sequence", 0),
+                    title=slide.get("title", ""),
+                    content=json.dumps(slide.get("content", {})),
+                    chunk_type="slide"
+                )
+                db.add(chunk)
+            
+            document = await db.get(Document, document_id)
+            if document:
+                document.status = "completed"
+                db.add(document)
+            
+            await db.commit()
+            
+            await manager.broadcast(json.dumps({"status": "completed", "message": "Processing finished successfully"}), document_id)
+            logger.info(f"Document {document_id} processing completed.")
+
+        except Exception as e:
+            logger.error(f"Error in processing pipeline for document {document_id}: {e}")
+            await manager.broadcast(json.dumps({"status": "error", "message": str(e)}), document_id)
+            document = await db.get(Document, document_id)
+            if document:
+                document.status = "error"
+                db.add(document)
+                await db.commit()
+
+@router.post("/upload-url")
+async def upload_from_url(
+    request: UploadURLRequest,
+    background_tasks: BackgroundTasks,
+    db: AsyncSession = Depends(get_db)
+):
+    # Create Document record
+    filename = request.url.split("/")[-1] or f"doc_{uuid.uuid4()}.pdf"
+    
+    # Define local path
+    upload_dir = os.path.join(settings.base_dir, "data", "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid.uuid4()}_{filename}")
+
+    # Download file
+    try:
+        await download_file(request.url, file_path)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to download file: {str(e)}")
+
+    new_doc = Document(
+        filename=filename,
+        file_path=file_path,
+        user_id=request.user_id,
+        status="pending"
+    )
+    db.add(new_doc)
+    await db.commit()
+    await db.refresh(new_doc)
+
+    # Start background processing
+    # We need a way to pass a session factory or handle session in background task
+    # Since we can't easily pass the session factory from here without circular imports or complex setup,
+    # we will use a workaround: import the sessionmaker from database.py
+    from models.database import async_session
+    
+    background_tasks.add_task(process_full_pipeline, new_doc.id, file_path, async_session)
+
+    return {"message": "Document uploaded and processing started", "document_id": new_doc.id}
 
 async def process_document_task(document_id: int, db: AsyncSession):
     try:
