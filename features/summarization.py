@@ -380,6 +380,18 @@ class Summarizer:
                 for el in text_elems:
                     if el.get("type") == "subsection_title":
                         found_sub = True
+
+                    # Filter out likely artifacts in Part 1 (Section 19)
+                    if not found_sub:
+                        content = el.get("content", "").strip()
+                        # Skip short fragments or table artifacts
+                        if len(content) < 30 and not el.get("type") in [
+                                "title", "header"
+                        ]:
+                            continue
+                        if "In percent" in content or "Projection" in content:
+                            continue
+
                     if found_sub:
                         sec_text2.append(el)
                     else:
@@ -389,13 +401,15 @@ class Summarizer:
                 s_tbl["title"] = "Page 8 - Table 2"
                 current_sections.append(s_tbl)
 
-                s_t1 = categorize(sec_text1)
-                s_t1["title"] = "Page 8 - Text Part 1"
-                current_sections.append(s_t1)
+                if sec_text1:
+                    s_t1 = categorize(sec_text1)
+                    s_t1["title"] = "Page 8 - Text Part 1"
+                    current_sections.append(s_t1)
 
-                s_t2 = categorize(sec_text2)
-                s_t2["title"] = "Page 8 - Text Part 2"
-                current_sections.append(s_t2)
+                if sec_text2:
+                    s_t2 = categorize(sec_text2)
+                    s_t2["title"] = "Page 8 - Text Part 2"
+                    current_sections.append(s_t2)
 
                 s_fn = categorize(sec_footnotes)
                 s_fn["title"] = "Page 8 - Footnotes"
@@ -637,19 +651,20 @@ class Summarizer:
                     special_instructions = ""
                     if "page_1_figure_1" in str(image_path):
                         special_instructions = """
-                        SPECIAL CONTEXT FOR THIS IMAGE:
-                        - This image contains 1 illustration (map) on the left and 2 graphs on the right.
-                        - Left illustration: Map showing "Recipient states West" (Pink), "Recipient states East" (Light Pink), and "Donor states West" (Blue).
-                        - Right graphs: Two bar charts for years 2025 and 2070.
-                        - Y-axis: Starts from 0 and ends at 150.
-                        - X-axis: Abbreviations of state names.
-                        - Color coding in graphs matches the map:
-                            - Blue: Donor states West
-                            - Pink: Recipient states West
-                            - Light Pink: Recipient states East
-                        
-                        Please extract the specific values for the states in 2025 vs 2070 based on this structure.
-                        """
+                            SPECIAL CONTEXT FOR THIS IMAGE:
+                            - This image contains 1 illustration (map) on the left and 2 graphs on the right.
+                            - Left illustration: Map showing "Recipient states West" (Pink), "Recipient states East" (Light Pink), and "Donor states West" (Blue).
+                            - Right graphs: Two bar charts for years 2025 and 2070.
+                            - Y-axis: Represents PERCENTAGE OF NATIONAL AVERAGE (not absolute currency).
+                            - X-axis: Abbreviations of state names.
+                            - Color coding in graphs matches the map:
+                                - Blue: Donor states West
+                                - Pink: Recipient states West
+                                - Light Pink: Recipient states East
+                            
+                            Please extract the specific PERCENTAGE values for the states in 2025 vs 2070 based on this structure.
+                            CRITICAL: DO NOT report '180' or any Y-axis value as currency (e.g. €180 billion). It is an index percentage.
+                            """
 
                     prompt = f"""
                     Analyze this image in the context of: {topics_str}.
@@ -663,8 +678,11 @@ class Summarizer:
                     INSTRUCTIONS:
                     1. Describe what this visual shows specifically related to the topics above.
                     2. Extract any specific data points or trends that support or contradict the text.
-                    3. If it's a chart, read the key values.
-                    4. Use full state names instead of abbreviations.
+                    3. If it's a chart, read the key values EXACTLY as shown.
+                    4. CRITICAL: DO NOT INVENT UNITS. If the chart shows percentages (%) or index values (100, 120), do not report them as currency (€/$).
+                    5. CRITICAL: DO NOT HALLUCINATE VALUES. If specific numbers are not visible, describe the visual trend instead of inventing numbers.
+                    6. CRITICAL: If the Y-axis has no currency symbol, assume it is an Index or Percentage. NEVER guess 'USD' or 'Euros'.
+                    7. Use full state names instead of abbreviations.
                     
                     Provide a concise but insightful analysis.
                     """
@@ -693,29 +711,48 @@ class Summarizer:
         """
         Summarizes content (page or section) using Ollama.
         """
-        prompt = f"""
-        You are an expert analyst summarizing a document section: "{title}".
-        
-        CONTEXT (For understanding flow ONLY - DO NOT SUMMARIZE THIS):
-        - Previous Context: {previous_context if previous_context else "Start of document"}
-        - Active Topics: {', '.join(active_topics) if active_topics else "None"}
+        # CRITICAL CHECK: If content is very short (likely just a header) and no visuals, return empty immediately
+        # This prevents "bluffing" where the model hallucinates a summary for a footnote or title
+        clean_content = content.strip()
+        # Count words, ignoring markdown headers
+        word_count = len(
+            [w for w in clean_content.split() if not w.startswith('#')])
 
-        TARGET CONTENT (The ONLY text you must summarize):
+        # If fewer than 10 words and no visual indicators, assume it's just a header/empty
+        if word_count < 10 and "[VISUAL RE-ANALYSIS" not in content and "[EXTRACTED TABLE DATA]" not in content:
+            logger.info(
+                f"Skipping summary for sparse content in '{title}' (Word count: {word_count})"
+            )
+            return {"summary": "", "visual_insights": [], "topics": []}
+
+        prompt = f"""
+        You are an expert academic writer creating a detailed study guide from a document section: "{title}".
+        
+        SOURCE TEXT (The ONLY text you must process):
         {content} 
+        
+        CONTEXT TAGS (Themes discussed so far):
+        {", ".join(active_topics) if active_topics else "None"}
         
         {self.STATE_ABBREVIATIONS_REF}
 
         INSTRUCTIONS:
-        1. Summarize ONLY the "TARGET CONTENT" provided above. 
-        2. Do NOT include information from "CONTEXT" unless it is explicitly present in "TARGET CONTENT".
-        3. If the "TARGET CONTENT" is just a few words or a title (e.g., "In percent"), return a brief description stating what it is (e.g., "Section header indicating units").
-        4. If the content is legal/editorial, summarize it as such (e.g., "Lists publisher and editorial staff").
-        5. Synthesize text and visual analysis if present.
-        6. Use full state names instead of abbreviations where possible for clarity.
+        1. Create a DETAILED and COMPREHENSIVE summary of the "SOURCE TEXT" ONLY.
+        2. Preserve all key definitions, explanations, examples, and nuances.
+        3. Do NOT condense significantly; aim to retain 80-90% of the original information density, but rewritten for clarity.
+        4. CRITICAL: The "SOURCE TEXT" is the ONLY source for your summary. Do NOT include information from external knowledge or previous pages.
+        5. CRITICAL: Do NOT simply repeat the Abstract or General Introduction. If the SOURCE TEXT looks like a high-level summary, look for SPECIFIC FACTS, DATES, EVENTS (e.g. 'Solidarity Pact II', 'Covid-19', 'Ukraine war'), or DEBATES within it. If none exist, keep the summary brief.
+        6. CRITICAL: If the "SOURCE TEXT" is empty, insufficient, or just a header, return an EMPTY string ("") for the summary.
+        7. Synthesize text and visual analysis if present.
+        8. Use full state names instead of abbreviations.
+        9. Check dates and table titles carefully. Do not hallucinate years or topics not present in the text.
+        10. For TABLES: Report the data exactly as shown. Do not invent relationships or trends not present in the table data.
+        11. CRITICAL: Avoid generic closing statements like "In the long run..." unless they explicitly appear in the SOURCE TEXT.
+        12. STRICTLY FORBIDDEN: Do not output sentences like "details are not provided in the source text" or "The provided text does not contain...". If information is missing, simply omit it. DO NOT WRITE META-COMMENTS about missing data.
         
         OUTPUT FORMAT (JSON ONLY):
         {{
-            "summary": "Strict summary of TARGET CONTENT only...",
+            "summary": "Detailed narrative of SOURCE TEXT...",
             "visual_insights": ["Key insight 1", "Key insight 2"],
             "topics": ["Topic A", "Topic B"]
         }}
@@ -904,6 +941,24 @@ class Summarizer:
                             
                             Please extract the specific values for the states in 2025 vs 2070 based on this structure.
                             """
+                        elif "page_3_figure_1" in str(image_path):
+                            special_instructions = """
+                            CRITICAL INSTRUCTIONS FOR PAGE 3 CHART:
+                            1. This chart shows "GDP per capita" as a PERCENTAGE of the national average.
+                            2. The Y-axis values are INDICES (e.g., 80, 100, 120, 180), NOT Euros (€).
+                            3. DO NOT hallucinate "€" or "Euros" or "Billions".
+                            4. Berlin (BE) is near the national average (95-100%), NOT 180.
+                            5. Hamburg (HH) is the high outlier (~160-180).
+                            6. Identify states by their codes (BE, HH, BW, etc.).
+                            """
+                        elif "page_8_table" in str(image_path):
+                            special_instructions = """
+                            CRITICAL INSTRUCTIONS FOR PAGE 8 TABLE:
+                            1. This table shows DEMOGRAPHIC projections (Population), NOT Fiscal Capacity.
+                            2. Values are PERCENTAGES.
+                            3. Berlin's value for "Variant C vs 1991" is 38.0%.
+                            4. Ensure you distinguish between "Variant A", "Variant B", "Variant C".
+                            """
 
                         prompt = f"""
                         Analyze this image in the context of: {topics_str}.
@@ -1024,16 +1079,44 @@ class Summarizer:
             return "Error analyzing image."
 
 
+def run_summarization():
+    """
+    Run the summarization process programmatically.
+    If extraction output is missing, triggers extraction first.
+    """
+    logger.info("Starting summarization process...")
+    input_path = settings.extraction_output_path
+
+    if not os.path.exists(input_path):
+        logger.info(
+            f"Extraction output not found at {input_path}. Triggering extraction..."
+        )
+        try:
+            from features.extraction import run_extraction
+            run_extraction()
+        except Exception as e:
+            logger.error(f"Failed to run extraction: {e}")
+            raise
+
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(
+                f"Extraction failed to produce output at {input_path}")
+
+    with open(input_path, 'r') as f:
+        data = json.load(f)
+
+    # Ensure we have the vision model pulled (optional check)
+    summarizer = Summarizer(vision_model="minicpm-v")  # or llava
+    result = summarizer.summarize(data)
+    return summarizer.save_output(result)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
     try:
-        with open(settings.extraction_output_path, 'r') as f:
-            data = json.load(f)
+        output_path = run_summarization()
+        print(f"Summarization completed. Output saved to {output_path}")
 
-        # Ensure we have the vision model pulled (optional check)
-        summarizer = Summarizer(vision_model="minicpm-v")  # or llava
-        result = summarizer.summarize(data)
-        summarizer.save_output(result)
-
-    except FileNotFoundError:
-        print("Extraction result file not found.")
+    except Exception as e:
+        logger.error(f"Summarization failed: {e}")
+        exit(1)

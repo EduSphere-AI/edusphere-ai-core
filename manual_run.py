@@ -4,6 +4,7 @@ import logging
 from config import settings
 from features.extraction import Extraction
 from features.summarization import Summarizer
+from features.generation import SlideGenerator
 from utils.logging_config import setup_logging
 
 setup_logging()
@@ -37,7 +38,6 @@ def main():
         output_image_dir=images_dir,
         use_ollama=True,
         extract_images=True,
-        # pages=[3, 5, 8]  # Commented out to run all pages
     )
     extractor.extract()
     logger.info("Extraction completed.")
@@ -61,6 +61,20 @@ def main():
         json.dump(summary_result, f, indent=2, ensure_ascii=False)
 
     logger.info(f"Summarization completed. Saved to {summary_output_path}")
+
+    # 3. Generation
+    logger.info("--- Step 3: Generation ---")
+
+    generation_output = settings.generation_output_path
+    os.makedirs(os.path.dirname(generation_output), exist_ok=True)
+
+    generator = SlideGenerator()
+    # Use summarization output as input for generation
+    # This enables using the detailed summaries instead of raw extraction
+    generator.generate(input_file=summary_output_path,
+                       output_file=generation_output)
+
+    logger.info(f"Generation completed. Saved to {generation_output}")
 
 
 if __name__ == "__main__":

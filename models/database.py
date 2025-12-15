@@ -23,7 +23,7 @@ Base = declarative_base()
 class User(Base):
     __tablename__ = "users"
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(String, primary_key=True, index=True)
     email = Column(String, unique=True, index=True, nullable=False)
     hashed_password = Column(String,
                              nullable=True)  # Nullable for Google auth users
@@ -42,10 +42,11 @@ class User(Base):
 class Document(Base):
     __tablename__ = "documents"
 
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(Integer, ForeignKey("users.id"))
+    id = Column(String, primary_key=True, index=True)
+    user_id = Column(String, ForeignKey("users.id"))
     filename = Column(String, nullable=False)
     file_path = Column(String, nullable=False)
+    source_url = Column(String, nullable=True)
     upload_date = Column(DateTime(timezone=True), server_default=func.now())
     status = Column(
         String, default="uploaded")  # uploaded, processing, completed, error
@@ -63,7 +64,7 @@ class ExtractedContent(Base):
     __tablename__ = "extracted_content"
 
     id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(Integer, ForeignKey("documents.id"))
+    document_id = Column(String, ForeignKey("documents.id"))
     content_type = Column(String,
                           nullable=False)  # header, paragraph, image, etc.
     text_content = Column(Text, nullable=True)
@@ -82,7 +83,7 @@ class Chunk(Base):
     __tablename__ = "chunks"
 
     id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(Integer, ForeignKey("documents.id"))
+    document_id = Column(String, ForeignKey("documents.id"))
     sequence_order = Column(Integer, nullable=False)
     title = Column(String, nullable=True)
     content = Column(

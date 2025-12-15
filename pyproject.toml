@@ -26,4 +26,5 @@ dependencies = [
     "nltk>=3.9.2",
     "scikit-learn>=1.8.0",
     "pymupdf>=1.26.6",
+    "supabase>=2.3.0",
 ]
