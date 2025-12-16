@@ -209,7 +209,8 @@ class ContentElement:
         if self.image_context:
             result["image_context"] = self.image_context.to_dict()
         if self.table_data:
-            result["table_data"] = self.table_data
+            # Wrap rows in dicts to avoid nested arrays (Firestore limitation)
+            result["table_data"] = [{"row": row} for row in self.table_data]
             result["table_headers"] = self.table_headers
         if self.bullet_items:
             result["bullet_items"] = self.bullet_items
@@ -262,13 +263,15 @@ class Section:
         if self.paragraphs:
             result["paragraphs"] = [p.content for p in self.paragraphs]
         if self.bullet_points:
-            result["bullet_points"] = [
-                bp.bullet_items or [bp.content] for bp in self.bullet_points
-            ]
+            result["bullet_points"] = [{
+                "bullet_items":
+                bp.bullet_items or [bp.content]
+            } for bp in self.bullet_points]
         if self.numbered_lists:
-            result["numbered_lists"] = [
-                nl.bullet_items or [nl.content] for nl in self.numbered_lists
-            ]
+            result["numbered_lists"] = [{
+                "bullet_items":
+                nl.bullet_items or [nl.content]
+            } for nl in self.numbered_lists]
         if self.figures:
             result["figures"] = [f.to_dict() for f in self.figures]
         if self.tables:
