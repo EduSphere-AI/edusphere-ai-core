@@ -1,135 +1,101 @@
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
-from sqlalchemy.orm import declarative_base, relationship, backref
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, func, ForeignKey, Text, JSON
-import os
+from typing import Optional, List, Any, Dict
+from datetime import datetime, timezone
+from utils.firebase import get_firestore_client
+from google.cloud.firestore_v1.base_query import FieldFilter
+from firebase_admin import firestore
+import logging
 
-# Database URL - update with your PostgreSQL credentials
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql+asyncpg://postgres:postgres@localhost:5432/edusphere")
-
-# Create async engine
-engine = create_async_engine(DATABASE_URL, echo=True)
-
-# Create session factory
-async_session_maker = async_sessionmaker(engine,
-                                         class_=AsyncSession,
-                                         expire_on_commit=False)
-
-# Base class for models
-Base = declarative_base()
+logger = logging.getLogger(__name__)
 
 
-class User(Base):
-    __tablename__ = "users"
+class FirestoreDAO:
 
-    id = Column(String, primary_key=True, index=True)
-    email = Column(String, unique=True, index=True, nullable=False)
-    hashed_password = Column(String,
-                             nullable=True)  # Nullable for Google auth users
-    full_name = Column(String, nullable=True)
-    firebase_uid = Column(String, unique=True, nullable=True,
-                          index=True)  # For Google auth
-    auth_provider = Column(String, default="email")  # "email" or "google"
-    is_active = Column(Boolean, default=True)
-    is_verified = Column(Boolean, default=False)
-    created_at = Column(DateTime(timezone=True), server_default=func.now())
-    updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+    def __init__(self):
+        # We access the client lazily or ensure it is initialized
+        self.documents_collection = "documents"
 
-    documents = relationship("Document", back_populates="user")
+    @property
+    def db(self):
+        return get_firestore_client()
 
+    # --- Document Operations ---
 
-class Document(Base):
-    __tablename__ = "documents"
+    async def create_document(self, doc_data: Dict[str, Any]) -> str:
+        """Create a document record."""
+        doc_id = doc_data.pop("id", None)
+        if doc_data.get("upload_date") is None:
+            doc_data["upload_date"] = datetime.now(timezone.utc)
 
-    id = Column(String, primary_key=True, index=True)
-    user_id = Column(String, ForeignKey("users.id"))
-    filename = Column(String, nullable=False)
-    file_path = Column(String, nullable=False)
-    source_url = Column(String, nullable=True)
-    upload_date = Column(DateTime(timezone=True), server_default=func.now())
-    status = Column(
-        String, default="uploaded")  # uploaded, processing, completed, error
+        if doc_id:
+            self.db.collection(
+                self.documents_collection).document(doc_id).set(doc_data)
+            return doc_id
+        else:
+            _, doc_ref = self.db.collection(
+                self.documents_collection).add(doc_data)
+            return doc_ref.id
 
-    user = relationship("User", back_populates="documents")
-    extracted_content = relationship("ExtractedContent",
-                                     back_populates="document",
-                                     cascade="all, delete-orphan")
-    chunks = relationship("Chunk",
-                          back_populates="document",
-                          cascade="all, delete-orphan")
+    async def get_document(self, doc_id: str) -> Optional[Dict[str, Any]]:
+        doc_ref = self.db.collection(
+            self.documents_collection).document(doc_id)
+        doc = doc_ref.get()
+        if doc.exists:
+            data = doc.to_dict()
+            data["id"] = doc.id
+            return data
+        return None
 
+    async def get_all_documents(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Retrieve all documents ordered by upload_date desc."""
+        docs_ref = self.db.collection(self.documents_collection)
+        query = docs_ref.order_by(
+            "upload_date", direction=firestore.Query.DESCENDING).limit(limit)
+        docs = query.stream()
 
-class ExtractedContent(Base):
-    __tablename__ = "extracted_content"
+        results = []
+        for doc in docs:
+            data = doc.to_dict()
+            data["id"] = doc.id
+            results.append(data)
+        return results
 
-    id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(String, ForeignKey("documents.id"))
-    content_type = Column(String,
-                          nullable=False)  # header, paragraph, image, etc.
-    text_content = Column(Text, nullable=True)
-    metadata_info = Column(JSON, nullable=True)  # Position, style, etc.
-    sequence_order = Column(Integer, nullable=False)
-    parent_id = Column(Integer,
-                       ForeignKey("extracted_content.id"),
-                       nullable=True)  # For hierarchy
+    async def update_document_status(self, doc_id: str, status: str):
+        doc_ref = self.db.collection(
+            self.documents_collection).document(doc_id)
+        doc_ref.update({"status": status})
 
-    document = relationship("Document", back_populates="extracted_content")
-    children = relationship("ExtractedContent",
-                            backref=backref("parent", remote_side=[id]))
+    # --- Job/Process Operations ---
 
+    async def create_job(self, job_data: Dict[str, Any]) -> str:
+        """Create a new processing job tracker."""
+        job_id = job_data.pop("id", None)
+        if job_data.get("created_at") is None:
+            job_data["created_at"] = datetime.now(timezone.utc)
 
-class Chunk(Base):
-    __tablename__ = "chunks"
+        if job_id:
+            self.db.collection("jobs").document(job_id).set(job_data)
+            return job_id
+        else:
+            _, doc_ref = self.db.collection("jobs").add(job_data)
+            return doc_ref.id
 
-    id = Column(Integer, primary_key=True, index=True)
-    document_id = Column(String, ForeignKey("documents.id"))
-    sequence_order = Column(Integer, nullable=False)
-    title = Column(String, nullable=True)
-    content = Column(
-        Text, nullable=False)  # The summarized/formatted content for the slide
-    source_content_ids = Column(
-        JSON, nullable=True)  # List of ExtractedContent IDs used
-    chunk_type = Column(String, default="slide")  # slide, question_group
-
-    document = relationship("Document", back_populates="chunks")
-    learn_controls = relationship("LearnControl",
-                                  back_populates="chunk",
-                                  cascade="all, delete-orphan")
+    async def update_job(self, job_id: str, updates: Dict[str, Any]):
+        """Update job status and results."""
+        self.db.collection("jobs").document(job_id).update(updates)
 
 
-class LearnControl(Base):
-    __tablename__ = "learn_controls"
-
-    id = Column(Integer, primary_key=True, index=True)
-    chunk_id = Column(Integer, ForeignKey("chunks.id"))
-    question_text = Column(Text, nullable=False)
-    answer_text = Column(Text, nullable=True)  # Expected answer or key points
-    question_type = Column(String, default="free_text")
-
-    chunk = relationship("Chunk", back_populates="learn_controls")
+# Global instance
+db_dao = FirestoreDAO()
 
 
-# Dependency to get database session
-async def get_db():
-    async with async_session_maker() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception:
-            await session.rollback()
-            raise
-        finally:
-            await session.close()
+# Helper for dependency injection (placeholder)
+def get_db():
+    return db_dao
 
 
-# Function to create all tables
 async def create_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    pass  # No tables needed for Firestore
 
 
-# Function to drop all tables (use with caution)
 async def drop_tables():
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+    pass

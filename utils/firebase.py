@@ -1,5 +1,5 @@
 import firebase_admin
-from firebase_admin import credentials, auth, firestore
+from firebase_admin import credentials, firestore
 from config import settings
 import os
 import logging
@@ -42,32 +42,3 @@ def get_firestore_client():
     if not _firebase_initialized:
         initialize_firebase()
     return _db
-
-
-async def verify_firebase_token(token: str) -> Optional[dict]:
-    """
-    Verify a Firebase ID token and return the decoded claims.
-    
-    Args:
-        token: The Firebase ID token to verify
-        
-    Returns:
-        Dict containing user info (uid, email, name, etc.) or None if verification fails
-    """
-    try:
-        if not _firebase_initialized:
-            initialize_firebase()
-
-        decoded_token = auth.verify_id_token(token)
-        logger.debug(
-            f"Firebase token verified for user: {decoded_token.get('email')}")
-        return {
-            "uid": decoded_token.get("uid"),
-            "email": decoded_token.get("email"),
-            "name": decoded_token.get("name"),
-            "picture": decoded_token.get("picture"),
-            "email_verified": decoded_token.get("email_verified", False),
-        }
-    except Exception as e:
-        logger.error(f"Error verifying Firebase token: {e}")
-        return None

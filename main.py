@@ -5,8 +5,7 @@ import logging
 
 from utils.logging_config import setup_logging
 from utils.firebase import initialize_firebase
-from services import auth_router, content_router
-from models import create_tables
+from services import content_router
 
 setup_logging()
 logger = logging.getLogger(__name__)
@@ -18,8 +17,7 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting up application...")
     initialize_firebase()
-    await create_tables()
-    logger.info("Database tables created/verified")
+    logger.info("Firebase initialized")
     yield
     # Shutdown
     logger.info("Shutting down application...")
@@ -41,6 +39,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Include routers
+app.include_router(content_router)
+
 
 @app.get("/")
 async def root():
@@ -54,7 +55,3 @@ async def root():
 @app.get("/check")
 async def health_check(name: str):
     return {"message": "Hello World!"}
-
-
-app.include_router(auth_router)
-app.include_router(content_router)

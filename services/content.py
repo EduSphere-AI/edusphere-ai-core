@@ -1,11 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from models.database import get_db, Document, Chunk
+from models.database import get_db, FirestoreDAO
 from features.summarization import Summarizer
 from features.extraction import Extraction
 from features.chunking import Chunker
 from services.websocket import manager
+from datetime import datetime, timezone
 from config import settings
 from utils.firebase import get_firestore_client
 from utils.supabase_client import get_supabase
@@ -30,13 +29,14 @@ def upload_image_to_supabase(file_path: str, destination_path: str) -> str:
         supabase = get_supabase()
         bucket = settings.supabase_bucket
 
-        # Check if bucket exists, if not create? (Supabase usually pre-creates)
-        # Just upload
         with open(file_path, 'rb') as f:
-            supabase.storage.from_(bucket).upload(
-                destination_path,
-                f,
-                file_options={"content-type": "image/png"})
+            supabase.storage.from_(bucket).upload(destination_path,
+                                                  f,
+                                                  file_options={
+                                                      "content-type":
+                                                      "image/png",
+                                                      "upsert": "true"
+                                                  })
 
         return supabase.storage.from_(bucket).get_public_url(destination_path)
     except Exception as e:
@@ -46,10 +46,11 @@ def upload_image_to_supabase(file_path: str, destination_path: str) -> str:
 
 class UploadURLRequest(BaseModel):
     url: str
-    user_id: str
+    user_id: str = "anonymous"  # Default to anonymous
     id: str | None = None  # Optional ID provided by client
 
 
+# WebSocket endpoint for backward compatibility or direct notifications
 @router.websocket("/ws/{document_id}")
 async def websocket_endpoint(websocket: WebSocket, document_id: str):
     await manager.connect(websocket, document_id)
@@ -74,338 +75,316 @@ def _download_file_sync(url: str, destination: str):
             f.write(chunk)
 
 
-async def process_full_pipeline(document_id: str, file_path: str,
-                                db_session_factory):
+async def process_full_pipeline(job_id: str, document_id: str, file_path: str,
+                                db: FirestoreDAO):
     """
     Full processing pipeline: Extraction -> Chunking -> Summarization
+    Updates Firestore 'jobs' collection at each step.
     """
-    async with db_session_factory() as db:
-        try:
-            loop = asyncio.get_running_loop()
-            await manager.broadcast(
-                json.dumps({
-                    "status": "processing",
-                    "step": "starting",
-                    "message": "Starting processing pipeline"
-                }), document_id)
+    try:
+        loop = asyncio.get_running_loop()
 
-            # 1. Extraction
-            await manager.broadcast(
-                json.dumps({
-                    "status": "processing",
-                    "step": "extraction",
-                    "message": "Extracting content from PDF"
-                }), document_id)
+        # --- STARTED ---
+        await db.update_job(
+            job_id, {
+                "status": "processing",
+                "stage": "started",
+                "message": "Starting processing pipeline",
+                "updated_at": datetime.now(timezone.utc)
+            })
 
-            output_dir = os.path.join(settings.base_dir, "output",
-                                      "extraction")
-            os.makedirs(output_dir, exist_ok=True)
-            extraction_output_file = os.path.join(
-                output_dir, f"extraction_{document_id}.json")
-            images_dir = os.path.join(settings.base_dir, "output", "images",
-                                      str(document_id))
-            os.makedirs(images_dir, exist_ok=True)
+        # --- 1. EXTRACTION ---
+        await db.update_job(job_id, {
+            "stage": "extraction",
+            "message": "Extracting content from PDF"
+        })
 
-            # Run extraction in thread pool
-            extractor = Extraction(inp_file_path=file_path,
-                                   output_file_path=extraction_output_file,
-                                   output_image_dir=images_dir,
-                                   use_ollama=True,
-                                   extract_images=True)
-            await loop.run_in_executor(None, extractor.extract)
+        output_dir = os.path.join(settings.base_dir, "output", "extraction")
+        os.makedirs(output_dir, exist_ok=True)
+        extraction_output_file = os.path.join(
+            output_dir, f"extraction_{document_id}.json")
 
-            with open(extraction_output_file, 'r') as f:
-                extraction_data = json.load(f)
+        images_dir = os.path.join(settings.base_dir, "output", "images",
+                                  str(document_id))
+        os.makedirs(images_dir, exist_ok=True)
 
-            # 1.1 Upload extracted images to Supabase & Save Extraction to Firestore
-            firestore_db = get_firestore_client()
-            doc_ref = firestore_db.collection("documents").document(
-                str(document_id))
+        # Run extraction
+        extractor = Extraction(inp_file_path=file_path,
+                               output_file_path=extraction_output_file,
+                               output_image_dir=images_dir,
+                               use_ollama=True,
+                               extract_images=True)
+        await loop.run_in_executor(None, extractor.extract)
 
-            # Process images in extraction data
-            # Assuming extraction_data is a list of content items
-            if isinstance(extraction_data, list):
-                for item in extraction_data:
-                    if item.get("type") == "Image" and item.get("image_path"):
-                        local_path = item["image_path"]
-                        if os.path.exists(local_path):
-                            filename = os.path.basename(local_path)
-                            supabase_path = f"{document_id}/{filename}"
-                            public_url = upload_image_to_supabase(
-                                local_path, supabase_path)
-                            if public_url:
+        with open(extraction_output_file, 'r') as f:
+            extraction_data = json.load(f)
+
+        # 1.1 Upload extracted images to Supabase
+        image_urls = []
+
+        # Helper to find items with images and upload them
+        def process_image_items(items):
+            for item in items:
+                # Determine image path
+                image_path = None
+                img_context = None
+
+                item_type = item.get("type", "").lower()
+                if (item_type == "image"
+                        or item_type == "figure") and item.get("image_path"):
+                    image_path = item["image_path"]
+                    img_context = item
+                elif item.get("image_context") and item["image_context"].get(
+                        "image_path"):
+                    image_path = item["image_context"]["image_path"]
+                    img_context = item["image_context"]
+
+                if image_path and img_context:
+                    # Resolve absolute path
+                    local_path = image_path
+                    if not os.path.isabs(local_path):
+                        # Try relative to extraction file
+                        candidate = os.path.join(
+                            os.path.dirname(extraction_output_file),
+                            local_path)
+                        if os.path.exists(candidate):
+                            local_path = candidate
+                        else:
+                            # Try relative to base output/images folder
+                            # The item path is likely "images/filename.png", we want "filename.png"
+                            filename_only = os.path.basename(local_path)
+                            candidate_2 = os.path.join(images_dir,
+                                                       filename_only)
+                            if os.path.exists(candidate_2):
+                                local_path = candidate_2
+
+                    if os.path.exists(local_path):
+                        filename = os.path.basename(local_path)
+                        supabase_path = f"{document_id}/{filename}"
+                        public_url = upload_image_to_supabase(
+                            local_path, supabase_path)
+                        if public_url:
+                            # Update the item with the public URL
+                            img_context["image_url"] = public_url
+                            # Also set on main item for easier access if it's a figure
+                            if item.get("type") in [
+                                    "figure", "chart", "Image"
+                            ]:
                                 item["image_url"] = public_url
-                                logger.info(f"Uploaded image to {public_url}")
 
-            # Save Extraction Result to Firestore
-            doc_ref.set(
-                {
-                    "status": "processing",
-                    "current_step": "chunking",
-                    "updated_at": firestore.SERVER_TIMESTAMP
+                            image_urls.append(public_url)
+                            logger.info(f"Uploaded image to {public_url}")
+
+        if isinstance(extraction_data, list):
+            process_image_items(extraction_data)
+        elif isinstance(extraction_data, dict) and "pages" in extraction_data:
+            # Handle page-based structure
+            for page in extraction_data["pages"]:
+                if "elements" in page:
+                    process_image_items(page["elements"])
+
+        # Save Extraction to Subcollection (Classic Architecture Support)
+        if extraction_data:
+            try:
+                # Use raw client to access subcollection
+                if db.db:
+                    results_ref = db.db.collection('documents').document(
+                        document_id).collection('results')
+                    results_ref.document('extraction').set({
+                        "content":
+                        extraction_data,
+                        "image_urls":
+                        image_urls,
+                        "updated_at":
+                        datetime.now(timezone.utc)
+                    })
+                    logger.info(
+                        f"Saved extraction data to subcollection for {document_id}"
+                    )
+                else:
+                    logger.warning(
+                        f"Firestore client not available, skipping extraction save for {document_id}"
+                    )
+            except Exception as ex:
+                logger.error(
+                    f"Failed to save extraction data to subcollection: {ex}")
+
+        # Update Job with Extraction Results
+        # Note: We do NOT save the full 'extraction_data' to Firestore because it exceeds the 1MB limit
+        # and may contain complex nested entities. The data is passed in-memory to the next steps.
+        await db.update_job(
+            job_id, {
+                "stage": "extraction_done",
+                "message": "Extraction completed",
+                "stats": {
+                    "items_extracted":
+                    len(extraction_data)
+                    if isinstance(extraction_data, list) else 0
                 },
-                merge=True)
-            doc_ref.collection("results").document("extraction").set(
-                {"content": extraction_data})
+                "image_urls": image_urls
+            })
 
-            # 2. Chunking
-            await manager.broadcast(
-                json.dumps({
-                    "status": "processing",
-                    "step": "chunking",
-                    "message": "Chunking content"
-                }), document_id)
-            chunker = Chunker()
-            chunks_data = await loop.run_in_executor(None, chunker.process,
-                                                     extraction_data)
+        # --- 2. CHUNKING ---
+        await db.update_job(job_id, {
+            "stage": "chunking",
+            "message": "Chunking content"
+        })
 
-            # Save chunks to DB (optional, or just use for summarization)
-            # For now, we'll skip saving raw chunks to DB to focus on slides,
-            # but in a real RAG system you'd save them here.
+        chunker = Chunker()
+        chunks_data = await loop.run_in_executor(None, chunker.process,
+                                                 extraction_data)
 
-            # 3. Summarization / Slide Generation
-            await manager.broadcast(
-                json.dumps({
-                    "status": "processing",
-                    "step": "summarization",
-                    "message": "Generating slides"
-                }), document_id)
-            summarizer = Summarizer()
-            slides = await loop.run_in_executor(None,
-                                                summarizer.generate_slides,
-                                                extraction_data)
+        # --- 3. SUMMARIZATION / GENERATION ---
+        await db.update_job(job_id, {
+            "stage": "summarization",
+            "message": "Generating slides with AI"
+        })
 
-            # 4. Save to DB & Firestore
-            await manager.broadcast(
-                json.dumps({
-                    "status": "processing",
-                    "step": "saving",
-                    "message": "Saving results"
-                }), document_id)
+        summarizer = Summarizer()
 
-            # Save Generation Result to Firestore
-            doc_ref.set(
-                {
-                    "status": "completed",
-                    "current_step": "completed",
-                    "updated_at": firestore.SERVER_TIMESTAMP
+        # Now returns a dict with 'slides', 'chapters', 'summary'
+        result_data = await loop.run_in_executor(None,
+                                                 summarizer.generate_slides,
+                                                 extraction_data)
+
+        slides = result_data.get("slides", [])
+        chapters = result_data.get("chapters", [])
+        summary = result_data.get("summary", {})
+
+        # Save Summary and Generation to Subcollections (Classic Architecture Support)
+        try:
+            if db.db:
+                results_ref = db.db.collection('documents').document(
+                    document_id).collection('results')
+
+                # Save Summary
+                results_ref.document('summarization').set(summary)
+
+                # Save Generation (Slides & Chapters)
+                results_ref.document('generation').set({
+                    "slides":
+                    slides,
+                    "chapters":
+                    chapters,
+                    "updated_at":
+                    datetime.now(timezone.utc)
+                })
+                logger.info(
+                    f"Saved summary and generation data to subcollections for {document_id}"
+                )
+            else:
+                logger.warning(
+                    f"Firestore client not available, skipping summary/generation save for {document_id}"
+                )
+        except Exception as ex:
+            logger.error(f"Failed to save summary/generation data: {ex}")
+
+        # --- 4. COMPLETED ---
+
+        # Save final result
+        await db.update_job(
+            job_id, {
+                "status": "completed",
+                "stage": "generation_done",
+                "message": "Processing finished successfully",
+                "result_json": {
+                    "slides": slides,
+                    "chapters": chapters
                 },
-                merge=True)
-            doc_ref.collection("results").document("generation").set(
-                {"slides": slides})
+                "updated_at": datetime.now(timezone.utc)
+            })
 
-            for slide in slides:
-                chunk = Chunk(document_id=document_id,
-                              sequence_order=slide.get("sequence", 0),
-                              title=slide.get("title", ""),
-                              content=json.dumps(slide.get("content", {})),
-                              chunk_type="slide")
-                db.add(chunk)
+        # Also update the Document record status if needed
+        await db.update_document_status(document_id, "completed")
 
-            document = await db.get(Document, document_id)
-            if document:
-                document.status = "completed"
-                db.add(document)
+        logger.info(
+            f"Job {job_id} / Document {document_id} processing completed.")
 
-            await db.commit()
-
-            await manager.broadcast(
-                json.dumps({
-                    "status": "completed",
-                    "message": "Processing finished successfully"
-                }), document_id)
-            logger.info(f"Document {document_id} processing completed.")
-
-        except Exception as e:
-            logger.error(
-                f"Error in processing pipeline for document {document_id}: {e}"
-            )
-            await manager.broadcast(
-                json.dumps({
-                    "status": "error",
-                    "message": str(e)
-                }), document_id)
-            document = await db.get(Document, document_id)
-            if document:
-                document.status = "error"
-                db.add(document)
-                await db.commit()
+    except Exception as e:
+        logger.error(f"Error in processing pipeline for job {job_id}: {e}")
+        await db.update_job(
+            job_id, {
+                "status": "error",
+                "message": str(e),
+                "updated_at": datetime.now(timezone.utc)
+            })
+        await db.update_document_status(document_id, "error")
 
 
 @router.get("/documents/{document_id}")
-async def get_document(document_id: str, db: AsyncSession = Depends(get_db)):
-    document = await db.get(Document, document_id)
+async def get_document(document_id: str, db: FirestoreDAO = Depends(get_db)):
+    document = await db.get_document(document_id)
     if not document:
         raise HTTPException(status_code=404, detail="Document not found")
-    return {
-        "id": document.id,
-        "filename": document.filename,
-        "status": document.status,
-        "source_url": document.source_url,
-        "upload_date": document.upload_date,
-    }
+    return document
 
 
-@router.post("/upload-url")
-async def upload_from_url(request: UploadURLRequest,
-                          background_tasks: BackgroundTasks,
-                          db: AsyncSession = Depends(get_db)):
-    # Create Document record
+@router.get("/documents")
+async def list_documents(limit: int = 50, db: FirestoreDAO = Depends(get_db)):
+    """List all recent documents (anonymous/stateless)."""
+    return await db.get_all_documents(limit=limit)
+
+
+@router.post("/process")
+async def start_process(request: UploadURLRequest,
+                        background_tasks: BackgroundTasks,
+                        db: FirestoreDAO = Depends(get_db)):
+    """
+    Start the processing pipeline using the new Job-based architecture.
+    """
+    # 1. Create Document Record
     filename = request.url.split("/")[-1] or f"doc_{uuid.uuid4()}.pdf"
-
-    # Use provided ID or generate new one
     document_id = request.id if request.id else str(uuid.uuid4())
 
-    # Define local path
+    # Define local path for processing
     upload_dir = os.path.join(settings.base_dir, "data", "uploads")
     os.makedirs(upload_dir, exist_ok=True)
     file_path = os.path.join(upload_dir, f"{document_id}_{filename}")
 
-    # Download file
+    # Download file locally for processing
     try:
         await download_file(request.url, file_path)
     except Exception as e:
-        raise HTTPException(status_code=400,
-                            detail=f"Failed to download file: {str(e)}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Failed to download file from Supabase: {str(e)}")
 
-    new_doc = Document(id=document_id,
-                       filename=filename,
-                       file_path=file_path,
-                       source_url=request.url,
-                       user_id=request.user_id,
-                       status="pending")
-    db.add(new_doc)
-    await db.commit()
-    await db.refresh(new_doc)
+    # Save initial document record
+    await db.create_document({
+        "id": document_id,
+        "filename": filename,
+        "source_url": request.url,
+        "user_id": request.user_id,  # Can be "anonymous" or ignored
+        "status": "processing",
+        "upload_date": datetime.now(timezone.utc)
+    })
 
-    # Start background processing
-    # We need a way to pass a session factory or handle session in background task
-    # Since we can't easily pass the session factory from here without circular imports or complex setup,
-    # we will use a workaround: import the sessionmaker from database.py
-    from models.database import async_session_maker
+    # 2. Create Job Record
+    job_id = f"job_{document_id}"
+    await db.create_job({
+        "id": job_id,
+        "document_id": document_id,
+        "user_id": request.user_id,  # Can be "anonymous" or ignored
+        "file_url": request.url,
+        "status": "processing",
+        "stage": "started",
+        "created_at": datetime.now(timezone.utc)
+    })
 
-    background_tasks.add_task(process_full_pipeline, new_doc.id, file_path,
-                              async_session_maker)
+    # 3. Start Background Worker
+    background_tasks.add_task(process_full_pipeline, job_id, document_id,
+                              file_path, db)
 
     return {
-        "message": "Document uploaded and processing started",
-        "document_id": new_doc.id
+        "message": "Processing started",
+        "job_id": job_id,
+        "document_id": document_id
     }
 
 
-async def process_document_task(document_id: str, db: AsyncSession):
-    try:
-        # 1. Extraction (Assuming this is done previously and saved to disk)
-        # In a real pipeline, we might call the extraction service here.
-        # For now, we assume extraction_result.json exists at the path defined in settings.
-
-        extraction_path = settings.extraction_output_path
-        if not os.path.exists(extraction_path):
-            logger.error(f"Extraction result not found at {extraction_path}")
-            # Potentially trigger extraction here
-            return
-
-        with open(extraction_path, 'r') as f:
-            extraction_data = json.load(f)
-
-        # 2. Slide Generation using Enhanced Summarizer
-        logger.info(f"Starting slide generation for document {document_id}")
-
-        summarizer = Summarizer()
-        slides = summarizer.generate_slides(extraction_data)
-
-        # 3. Save slides to database as Chunks
-        # First, clear existing chunks for this document to avoid duplicates if re-running
-        # (Optional, but good for idempotency)
-        # await db.execute(delete(Chunk).where(Chunk.document_id == document_id))
-
-        for slide in slides:
-            chunk = Chunk(document_id=document_id,
-                          sequence_order=slide.get("sequence", 0),
-                          title=slide.get("title", ""),
-                          content=json.dumps(slide.get("content", {})),
-                          chunk_type="slide")
-            db.add(chunk)
-
-        await db.commit()
-
-        # Update document status
-        document = await db.get(Document, document_id)
-        if document:
-            document.status = "completed"
-            await db.commit()
-        logger.info(
-            f"Document {document_id} processing completed. Generated {len(slides)} slides."
-        )
-
-    except Exception as e:
-        logger.error(f"Error processing document {document_id}: {e}")
-        document = await db.get(Document, document_id)
-        if document:
-            document.status = "error"
-            await db.commit()
-
-
-@router.post("/{document_id}/process")
-async def process_document(document_id: str,
-                           background_tasks: BackgroundTasks,
-                           db: AsyncSession = Depends(get_db)):
-    document = await db.get(Document, document_id)
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    document.status = "processing"
-    await db.commit()
-
-    # Run in background
-    background_tasks.add_task(process_document_task, document_id, db)
-
-    return {"message": "Document processing started"}
-
-
-@router.post("/{document_id}/generate-slides")
-async def generate_slides(document_id: str,
-                          db: AsyncSession = Depends(get_db)):
-    """
-    Manually trigger slide generation for a document.
-    """
-    await process_document_task(document_id, db)
-    return {"message": "Slide generation completed"}
-
-
-@router.get("/{document_id}/export")
-async def export_content(document_id: int, db: AsyncSession = Depends(get_db)):
-    """
-    Export the generated content (slides) for a document in JSON format.
-    """
-    document = await db.get(Document, document_id)
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-
-    # Fetch chunks
-    result = await db.execute(
-        select(Chunk).where(Chunk.document_id == document_id).order_by(
-            Chunk.sequence_order))
-    chunks = result.scalars().all()
-
-    export_data = {
-        "document_id": document.id,
-        "filename": document.filename,
-        "slides": []
-    }
-
-    for chunk in chunks:
-        try:
-            slide_content = json.loads(chunk.content)
-        except json.JSONDecodeError:
-            slide_content = {"raw_content": chunk.content}
-
-        export_data["slides"].append({
-            "id": chunk.id,
-            "sequence": chunk.sequence_order,
-            "type": chunk.chunk_type,
-            "title": chunk.title,
-            "content": slide_content
-        })
-
-    return export_data
+# Backward compatibility (Upload from URL) - maps to start_process logic
+@router.post("/upload-url")
+async def upload_from_url(request: UploadURLRequest,
+                          background_tasks: BackgroundTasks,
+                          db: FirestoreDAO = Depends(get_db)):
+    return await start_process(request, background_tasks, db)

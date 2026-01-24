@@ -1041,7 +1041,7 @@ class Extraction:
 
             try:
                 # Clip bbox to page boundaries
-                clipped_bbox = (max(0, bbox[0]), max(0, bbox[1]),
+                clipped_bbox = (max(0, int(bbox[0])), max(0, int(bbox[1])),
                                 min(page_width,
                                     bbox[2]), min(page_height, bbox[3]))
 
@@ -1963,8 +1963,8 @@ Return ONLY a JSON object with this structure:
 
             for idx, table_data in enumerate(page_tables):
                 # Filter: Only extract tables for specific pages as requested
-                if (page_num + 1) not in [5, 8]:
-                    continue
+                # if (page_num + 1) not in [5, 8]:
+                #    continue
 
                 if not table_data:
                     continue
@@ -2168,6 +2168,23 @@ Return ONLY a JSON object with this structure:
                 if vision_success:
                     table_metadata["extraction_method"] = "vision"
 
+                    # Save the visual representation of the table/chart
+                    if self.output_image_dir:
+                        table_img_filename = f"page_{page_num + 1}_table_{len(tables) + 1}.png"
+                        table_img_path = os.path.join(self.output_image_dir,
+                                                      table_img_filename)
+
+                        try:
+                            # Ensure directory exists
+                            os.makedirs(self.output_image_dir, exist_ok=True)
+                            with open(table_img_path, "wb") as f:
+                                f.write(img_data)
+                            table_metadata["image_path"] = table_img_path
+                            logger.info(
+                                f"Saved table image to {table_img_path}")
+                        except Exception as e:
+                            logger.warning(f"Failed to save table image: {e}")
+
                 table_element = ContentElement(
                     id=self._generate_id("table"),
                     type=ElementType.TABLE.value,
@@ -2336,7 +2353,7 @@ Return ONLY a JSON object with this structure:
 
                     element = ContentElement(
                         id=self._generate_id("region_text"),
-                        type=elem_type.value,
+                        type=str(elem_type.value),
                         content=block_text,
                         position=Position(x0=rx0,
                                           y0=rtop,
@@ -2521,7 +2538,7 @@ Return ONLY a JSON object with this structure:
                 bullet_items = self._extract_bullet_items(block_text)
 
             element = ContentElement(id=self._generate_id("text"),
-                                     type=elem_type.value,
+                                     type=str(elem_type.value),
                                      content=block_text,
                                      position=Position(x0=b_x0,
                                                        y0=b_y0,
@@ -2741,6 +2758,23 @@ Return ONLY a JSON object with this structure:
                 # Body text (9.2pt) should not merge with footnotes (7pt)
                 is_same_size = abs(seg['size'] - last_seg['size']) < 1.0
 
+                # Analyze Boldness / Heading status
+                last_is_heading = last_seg.get('bold_ratio', 0) > 0.8
+                curr_is_heading = seg.get('bold_ratio', 0) > 0.8
+                curr_is_body = seg.get('bold_ratio', 0) < 0.2
+
+                # --- SPECIAL CASE: Header Wrapping ---
+                # If both are headings, are same size, and vertically close, merge them
+                # even if they don't overlap horizontally (e.g. wrapped title).
+                is_wrapping_header = last_is_heading and curr_is_heading and is_same_size and is_vertical_close
+
+                if is_wrapping_header:
+                    # Skip standard alignment and abbrev checks
+                    block.append(seg)
+                    merged = True
+                    break
+
+                # Standard Merge Logic
                 # Allow merging if previous line ends with hyphen (even if size differs slightly)
                 # This handles cases where a footnote marker interrupts a hyphenated word
                 prev_ends_hyphen = last_seg['text'].strip().endswith('-')
@@ -2769,8 +2803,8 @@ Return ONLY a JSON object with this structure:
                     # Check for bold transition (Heading -> Body)
                     # If previous line is mostly bold (>80%) and current is not (<20%), don't merge
                     # This prevents merging section titles with the first paragraph
-                    last_is_heading = last_seg.get('bold_ratio', 0) > 0.8
-                    curr_is_body = seg.get('bold_ratio', 0) < 0.2
+                    # last_is_heading = last_seg.get('bold_ratio', 0) > 0.8  <-- Calculated above
+                    # curr_is_body = seg.get('bold_ratio', 0) < 0.2          <-- Calculated above
 
                     if last_is_heading and curr_is_body and not prev_ends_hyphen:
                         # Don't merge, and don't check other blocks
@@ -4021,8 +4055,13 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
                         }
 
                         # Filter out removed elements
+                        # KEEP figures and tables even if Ollama refinement drops them
                         page_elements = [
-                            e for e in page_elements if e.id in refined_map
+                            e for e in page_elements
+                            if e.id in refined_map or e.type in [
+                                ElementType.FIGURE.value,
+                                ElementType.TABLE.value
+                            ]
                         ]
 
                         # Update types

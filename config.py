@@ -5,9 +5,7 @@ import os
 
 class Settings(BaseSettings):
     # Database
-    database_url: str = Field(
-        default="postgresql+asyncpg://user:password@localhost:5432/edusphere",
-        env="DATABASE_URL")
+    # We are using Firebase Firestore as the main database.
 
     # JWT Settings
     secret_key: str = Field(
@@ -57,6 +55,7 @@ class Settings(BaseSettings):
     class Config:
         env_file = ".env"
         case_sensitive = False
+        extra = "ignore"
 
 
 settings = Settings()

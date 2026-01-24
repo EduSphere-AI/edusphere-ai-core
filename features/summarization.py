@@ -56,6 +56,137 @@ class Summarizer:
             f"Initialized Summarizer with text_model: {self.text_model}, vision_model: {self.vision_model}"
         )
 
+    def generate_slides(self, extraction_result: Dict[str,
+                                                      Any]) -> Dict[str, Any]:
+        """
+        Generate slides from extraction results.
+        Returns a dict containing 'slides' and 'summary'.
+        """
+        logger.info("Starting slide generation pipeline...")
+
+        # 1. Summarize content
+        summary_result = self.summarize(extraction_result)
+
+        # 2. Convert to slides using SlideGenerator logic
+        # Since SlideGenerator was designed to read from file, we'll adapt it here
+        # or instantiate it if available.
+        from features.generation import SlideGenerator
+
+        generator = SlideGenerator()
+
+        # Populate image_url_map from extraction_result so images work in slides
+        if isinstance(extraction_result, list):
+            for item in extraction_result:
+                if isinstance(item, dict) and item.get(
+                        "image_path") and item.get("image_url"):
+                    # Map both full path and basename to be safe
+                    generator.image_url_map[
+                        item["image_path"]] = item["image_url"]
+                    generator.image_url_map[os.path.basename(
+                        item["image_path"])] = item["image_url"]
+
+        # Handle dict case (page-based extraction returns {'pages': [...]})
+        elif isinstance(extraction_result,
+                        dict) and "pages" in extraction_result:
+            for page in extraction_result["pages"]:
+                if "elements" in page:
+                    for item in page["elements"]:
+                        if not isinstance(item, dict):
+                            continue
+
+                        # Robustly find image path and URL
+                        img_path = item.get("image_path")
+                        img_url = item.get("image_url")
+
+                        if not img_path and item.get("image_context"):
+                            img_path = item["image_context"].get("image_path")
+
+                        if not img_url and item.get("image_context"):
+                            img_url = item["image_context"].get("image_url")
+
+                        if img_path and img_url:
+                            generator.image_url_map[img_path] = img_url
+                            generator.image_url_map[os.path.basename(
+                                img_path)] = img_url
+
+        # We need to adapt the internal methods of SlideGenerator to work with data
+        # instead of files, or we pass the summary result directly if modified.
+
+        # For now, let's use the process_summary_input logic from SlideGenerator
+        # but exposed in a way we can get the objects back.
+
+        # Manually constructing the state and running generation
+        from features.generation import ProcessingState
+        state = ProcessingState()
+
+        # We need the topic summaries from the summary result
+        topic_summaries = summary_result.get("topic_summaries", [])
+
+        # Fallback: If no topic summaries (e.g. segmentation failed), use page summaries
+        if not topic_summaries and summary_result.get("page_summaries"):
+            logger.info(
+                "Using page summaries as fallback for slide generation")
+            for page in summary_result.get("page_summaries", []):
+                topic_summaries.append({
+                    "topic":
+                    f"Page {page['page_number']}",
+                    "summary":
+                    page["summary"],
+                    "key_insights":
+                    page.get("key_visuals", []),
+                    "detailed_visual_analysis":
+                    page.get("detailed_visual_analysis", []),
+                    "topics":
+                    page.get("topics", []),
+                    "original_content":
+                    ""  # Not available in this path
+                })
+
+        # Use the generator's logic to process these summaries into slides
+        generator._process_summary_input(topic_summaries, state)
+
+        # Now convert the state (Chapters/Slides) into the expected dictionary format
+        slides_data = []
+
+        # Also capture chapter metadata
+        chapters_data = []
+
+        for chapter in state.chapters:
+            chapters_data.append({
+                "chapter_num": chapter.chapter_num,
+                "main_title": chapter.main_title,
+                "subtitle": chapter.subtitle,
+                "learn_controls": chapter.learn_controls
+            })
+
+            for slide in chapter.slides:
+                slide_dict = {
+                    "sequence":
+                    slide.slide_num,  # Simplified sequence
+                    "title":
+                    slide.title,
+                    "chapter":
+                    chapter.chapter_num,  # Add chapter num to slide
+                    "content": [{
+                        "type": item.type,
+                        "text": item.content,
+                        "metadata": item.metadata
+                    } for item in slide.items],
+                    "chapter_title":
+                    chapter.main_title,
+                    "chapter_main_title":
+                    chapter.main_title,
+                    "subchapter":
+                    "Unknown"  # Placeholder, update if subchapter tracking is fixed
+                }
+                slides_data.append(slide_dict)
+
+        return {
+            "slides": slides_data,
+            "chapters": chapters_data,
+            "summary": summary_result
+        }
+
     def summarize(self, extraction_result: Dict[str, Any]) -> Dict[str, Any]:
         """
         Main entry point for document summarization.
@@ -512,6 +643,8 @@ class Summarizer:
                 section_output.get("visual_insights", []),
                 "visual_analysis":
                 visual_insights_data,
+                "detailed_visual_analysis":
+                visual_insights_data,  # Add this field to match generation.py expectation
                 "topics":
                 new_topics
             })
@@ -637,6 +770,11 @@ class Summarizer:
                 "analysis": "",
                 "source": "vision_model"
             }
+
+            if etype == "table":
+                analysis_entry["table_data"] = elem.get("table_data")
+                analysis_entry["table_headers"] = elem.get("table_headers")
+                analysis_entry["content"] = elem.get("content", "")
 
             if full_path and os.path.exists(full_path):
                 logger.info(

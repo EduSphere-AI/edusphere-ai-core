@@ -1,22 +1,20 @@
-from .database import User, get_db, create_tables, drop_tables
+from .database import get_db, FirestoreDAO
 from .schemas import (
-    UserCreate,
-    UserLogin,
-    UserResponse,
-    GoogleAuthRequest,
-    Token,
-    TokenData,
+    DocumentCreate,
+    DocumentResponse,
+    ExtractedContentCreate,
+    ExtractedContentResponse,
+    LearnControlCreate,
+    LearnControlResponse,
 )
 
 __all__ = [
-    "User",
     "get_db",
-    "create_tables",
-    "drop_tables",
-    "UserCreate",
-    "UserLogin",
-    "UserResponse",
-    "GoogleAuthRequest",
-    "Token",
-    "TokenData",
+    "FirestoreDAO",
+    "DocumentCreate",
+    "DocumentResponse",
+    "ExtractedContentCreate",
+    "ExtractedContentResponse",
+    "LearnControlCreate",
+    "LearnControlResponse",
 ]
