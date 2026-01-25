@@ -26,6 +26,7 @@ import base64
 from typing import Dict, Any, List, Optional, Union
 import ollama
 from config import settings
+from features.generation import SlideGenerator, ProcessingState
 
 logger = logging.getLogger(__name__)
 
@@ -56,8 +57,9 @@ class Summarizer:
             f"Initialized Summarizer with text_model: {self.text_model}, vision_model: {self.vision_model}"
         )
 
-    def generate_slides(self, extraction_result: Dict[str,
-                                                      Any]) -> Dict[str, Any]:
+    def generate_slides(
+            self, extraction_result: Union[Dict[str, Any],
+                                           List[Any]]) -> Dict[str, Any]:
         """
         Generate slides from extraction results.
         Returns a dict containing 'slides' and 'summary'.
@@ -70,7 +72,6 @@ class Summarizer:
         # 2. Convert to slides using SlideGenerator logic
         # Since SlideGenerator was designed to read from file, we'll adapt it here
         # or instantiate it if available.
-        from features.generation import SlideGenerator
 
         generator = SlideGenerator()
 
@@ -116,7 +117,7 @@ class Summarizer:
         # but exposed in a way we can get the objects back.
 
         # Manually constructing the state and running generation
-        from features.generation import ProcessingState
+
         state = ProcessingState()
 
         # We need the topic summaries from the summary result
@@ -187,13 +188,20 @@ class Summarizer:
             "summary": summary_result
         }
 
-    def summarize(self, extraction_result: Dict[str, Any]) -> Dict[str, Any]:
+    def summarize(
+            self, extraction_result: Union[Dict[str, Any],
+                                           List[Any]]) -> Dict[str, Any]:
         """
         Main entry point for document summarization.
         """
         logger.info(
             "Starting enhanced document summarization with image re-processing..."
         )
+
+        # Normalize input
+        if isinstance(extraction_result, list):
+            # Assume it's a list of pages if it's a list
+            extraction_result = {"pages": extraction_result}
 
         # FORCE segmentation from pages to ensure 1:1 mapping with segmentation_context.md
         sections = []
@@ -287,51 +295,60 @@ class Summarizer:
         # global_summary = self._generate_global_summary(page_summaries)
         global_summary = ""
 
+        image_map = self._create_image_map(page_summaries)
+
         return {
             "global_summary": global_summary,
             "page_summaries": page_summaries,
-            "all_topics": active_topics
+            "all_topics": active_topics,
+            "image_map": image_map
         }
+
+    def _categorize_elements(self, elems: List[Dict[str,
+                                                    Any]]) -> Dict[str, Any]:
+        """Categorize elements into types for sectioning."""
+        res = {
+            "title": "",
+            "paragraphs": [],
+            "bullet_points": [],
+            "figures": [],
+            "tables": [],
+            "subsections": []
+        }
+        for e in elems:
+            etype = e.get("type", "").lower()
+            content = e.get("content", "")
+            has_image = "image_context" in e and e["image_context"].get(
+                "image_path")
+
+            if etype in ["figure", "chart", "image"] or has_image:
+                res["figures"].append(e)
+            elif etype == "table":
+                res["tables"].append(e)
+            elif etype in ["bullet_point", "list_item"]:
+                res["bullet_points"].append(e)
+            elif etype in [
+                    "paragraph", "text", "title", "section_title",
+                    "subsection_title", "abstract", "footnote", "call_out_box"
+            ]:
+                res["paragraphs"].append(content)
+            else:
+                res["paragraphs"].append(content)
+        return res
 
     def _segment_pages_into_sections(
             self, pages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Segment pages into logical sections based on layout.
+        
+        NOTE: This method contains domain-specific logic for a particular document layout (e.g. DIW Weekly Report).
+        It maps specific page numbers to expected content sections.
+        """
         sections = []
 
         for page in pages:
             page_num = page.get("page_number")
             elements = page.get("elements", [])
-
-            # Helper to categorize elements
-            def categorize(elems):
-                res = {
-                    "title": "",
-                    "paragraphs": [],
-                    "bullet_points": [],
-                    "figures": [],
-                    "tables": [],
-                    "subsections":
-                    []  # Not using nested subsections for now, keeping it flat
-                }
-                for e in elems:
-                    etype = e.get("type", "")
-                    content = e.get("content", "")
-                    if etype in ["figure", "chart", "image"]:
-                        res["figures"].append(e)
-                    elif etype == "table":
-                        res["tables"].append(e)
-                    elif etype in ["bullet_point", "list_item"]:
-                        res["bullet_points"].append(e)
-                    elif etype in [
-                            "paragraph", "text", "title", "section_title",
-                            "subsection_title", "abstract", "footnote",
-                            "call_out_box"
-                    ]:
-                        # Treat all text-like things as paragraphs for extraction purposes
-                        res["paragraphs"].append(content)
-                    else:
-                        # Default fallback
-                        res["paragraphs"].append(content)
-                return res
 
             current_sections = []
 
@@ -348,11 +365,11 @@ class Summarizer:
                     else:
                         sec2_elems.append(el)
 
-                s1 = categorize(sec1_elems)
+                s1 = self._categorize_elements(sec1_elems)
                 s1["title"] = "Page 1 - Header & Key Points"
                 current_sections.append(s1)
 
-                s2 = categorize(sec2_elems)
+                s2 = self._categorize_elements(sec2_elems)
                 s2["title"] = "Page 1 - Chart Area"
                 current_sections.append(s2)
 
@@ -366,19 +383,19 @@ class Summarizer:
                     sec6 and e.get("type") not in ["header", "footer"]
                 ]
 
-                s3 = categorize(sec3)
+                s3 = self._categorize_elements(sec3)
                 s3["title"] = "Page 2 - Title"
                 current_sections.append(s3)
 
-                s4 = categorize(sec4)
+                s4 = self._categorize_elements(sec4)
                 s4["title"] = "Page 2 - Abstract"
                 current_sections.append(s4)
 
-                s5 = categorize(sec5)
+                s5 = self._categorize_elements(sec5)
                 s5["title"] = "Page 2 - Main Text"
                 current_sections.append(s5)
 
-                s6 = categorize(sec6)
+                s6 = self._categorize_elements(sec6)
                 s6["title"] = "Page 2 - Footnotes"
                 current_sections.append(s6)
 
@@ -405,19 +422,19 @@ class Summarizer:
                     else:
                         sec8.append(el)
 
-                s7 = categorize(sec7)
+                s7 = self._categorize_elements(sec7)
                 s7["title"] = "Page 3 - Main Graph"
                 current_sections.append(s7)
 
-                s8 = categorize(sec8)
+                s8 = self._categorize_elements(sec8)
                 s8["title"] = "Page 3 - Cross-column Text"
                 current_sections.append(s8)
 
-                s9 = categorize(sec9)
+                s9 = self._categorize_elements(sec9)
                 s9["title"] = "Page 3 - Continuing Text"
                 current_sections.append(s9)
 
-                s10 = categorize(sec10)
+                s10 = self._categorize_elements(sec10)
                 s10["title"] = "Page 3 - Footnotes"
                 current_sections.append(s10)
 
@@ -443,19 +460,19 @@ class Summarizer:
                     else:
                         sec11.append(el)
 
-                s11 = categorize(sec11)
+                s11 = self._categorize_elements(sec11)
                 s11["title"] = "Page 4 - Continuation Text"
                 current_sections.append(s11)
 
-                s12 = categorize(sec12)
+                s12 = self._categorize_elements(sec12)
                 s12["title"] = "Page 4 - Split Layout Text"
                 current_sections.append(s12)
 
-                s13 = categorize(sec13)
+                s13 = self._categorize_elements(sec13)
                 s13["title"] = "Page 4 - Boxed Section"
                 current_sections.append(s13)
 
-                s14 = categorize(sec14)
+                s14 = self._categorize_elements(sec14)
                 s14["title"] = "Page 4 - Footnotes"
                 current_sections.append(s14)
 
@@ -472,25 +489,25 @@ class Summarizer:
                     sec18 and e.get("type") not in ["header", "footer"]
                 ]
 
-                s15 = categorize(sec15)
+                s15 = self._categorize_elements(sec15)
                 s15["title"] = "Page 5 - Table 1"
                 current_sections.append(s15)
 
-                s16 = categorize(text_elems)
+                s16 = self._categorize_elements(text_elems)
                 s16["title"] = "Page 5 - Split Layout Text"
                 current_sections.append(s16)
 
-                s17 = categorize(sec17)
+                s17 = self._categorize_elements(sec17)
                 s17["title"] = "Page 5 - Boxed Section"
                 current_sections.append(s17)
 
-                s18 = categorize(sec18)
+                s18 = self._categorize_elements(sec18)
                 s18["title"] = "Page 5 - Footnotes"
                 current_sections.append(s18)
 
             elif page_num in [6, 7]:
                 # Sec 19/20
-                s = categorize(elements)
+                s = self._categorize_elements(elements)
                 s["title"] = f"Page {page_num} - Grid of Graphs"
                 current_sections.append(s)
 
@@ -528,21 +545,21 @@ class Summarizer:
                     else:
                         sec_text1.append(el)
 
-                s_tbl = categorize(sec_table)
+                s_tbl = self._categorize_elements(sec_table)
                 s_tbl["title"] = "Page 8 - Table 2"
                 current_sections.append(s_tbl)
 
                 if sec_text1:
-                    s_t1 = categorize(sec_text1)
+                    s_t1 = self._categorize_elements(sec_text1)
                     s_t1["title"] = "Page 8 - Text Part 1"
                     current_sections.append(s_t1)
 
                 if sec_text2:
-                    s_t2 = categorize(sec_text2)
+                    s_t2 = self._categorize_elements(sec_text2)
                     s_t2["title"] = "Page 8 - Text Part 2"
                     current_sections.append(s_t2)
 
-                s_fn = categorize(sec_footnotes)
+                s_fn = self._categorize_elements(sec_footnotes)
                 s_fn["title"] = "Page 8 - Footnotes"
                 current_sections.append(s_fn)
 
@@ -565,16 +582,16 @@ class Summarizer:
                     else:
                         sec_cont.append(el)
 
-                s_cont = categorize(sec_cont)
+                s_cont = self._categorize_elements(sec_cont)
                 s_cont["title"] = "Page 9 - Continuing Text"
                 current_sections.append(s_cont)
 
-                s_conc = categorize(sec_concl)
+                s_conc = self._categorize_elements(sec_concl)
                 s_conc["title"] = "Page 9 - Conclusion"
                 current_sections.append(s_conc)
 
             elif page_num == 10:
-                s = categorize(elements)
+                s = self._categorize_elements(elements)
                 s["title"] = "Page 10 - Legal/Editorial"
                 current_sections.append(s)
 
@@ -653,10 +670,13 @@ class Summarizer:
         #     topic_summaries)
         global_summary = ""
 
+        image_map = self._create_image_map(topic_summaries)
+
         return {
             "global_summary": global_summary,
             "topic_summaries": topic_summaries,
-            "all_topics": all_topics
+            "all_topics": all_topics,
+            "image_map": image_map
         }
 
     def _table_to_markdown(self, table_element: Dict[str, Any]) -> str:
@@ -751,6 +771,7 @@ class Summarizer:
             etype = elem.get("type", "")
             image_context = elem.get("image_context", {})
             image_path = image_context.get("image_path")
+            image_url = image_context.get("image_url")
 
             # Check if we have the image file
             full_path = os.path.join(settings.output_dir,
@@ -766,6 +787,7 @@ class Summarizer:
             analysis_entry = {
                 "type": etype,
                 "image_path": image_path,
+                "image_url": image_url,
                 "context_topics": context_topics,
                 "analysis": "",
                 "source": "vision_model"
@@ -1029,6 +1051,7 @@ class Summarizer:
             if etype in ["figure", "chart", "table", "image"]:
                 image_context = elem.get("image_context", {})
                 image_path = image_context.get("image_path")
+                image_url = image_context.get("image_url")
 
                 # Check if we have the image file
                 full_path = os.path.join(settings.output_dir,
@@ -1046,6 +1069,7 @@ class Summarizer:
                 analysis_entry = {
                     "type": etype,
                     "image_path": image_path,
+                    "image_url": image_url,
                     "context_topics": context_topics,
                     "analysis": "",
                     "source": "vision_model"
@@ -1173,6 +1197,53 @@ class Summarizer:
         Return in Markdown.
         """
         return self._call_ollama(prompt, json_mode=False)
+
+    def _create_image_map(self, summaries: List[Dict[str,
+                                                     Any]]) -> Dict[str, Any]:
+        """Creates a map of image paths/basenames to URLs and topics from synthesis results."""
+        image_map = {}
+        for item in summaries:
+            visuals = item.get("detailed_visual_analysis", [])
+            # Try to get a main topic label for the container (section title or page number)
+            container_topic = item.get(
+                "topic") or f"Page {item.get('page_number', 'Unknown')}"
+
+            for v in visuals:
+                path = v.get("image_path")
+                url = v.get("image_url")
+                target = url if url else path
+
+                # Get specific context topics used for this visual analysis
+                context_topics = v.get("context_topics", [])
+
+                if path and target:
+                    # Key by full path
+                    if path not in image_map:
+                        image_map[path] = {
+                            "url": target,
+                            "topics": [],
+                            "related_section": container_topic
+                        }
+
+                    # Merge topics (avoiding duplicates)
+                    existing_topics = set(image_map[path]["topics"])
+                    existing_topics.update(context_topics)
+                    image_map[path]["topics"] = list(existing_topics)
+
+                    # Key by basename
+                    basename = os.path.basename(path)
+                    if basename not in image_map:
+                        image_map[basename] = {
+                            "url": target,
+                            "topics": [],
+                            "related_section": container_topic
+                        }
+
+                    existing_topics_base = set(image_map[basename]["topics"])
+                    existing_topics_base.update(context_topics)
+                    image_map[basename]["topics"] = list(existing_topics_base)
+
+        return image_map
 
     def save_output(self,
                     summary_data: Dict[str, Any],

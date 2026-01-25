@@ -19,7 +19,7 @@ class ChunkingStrategy(Enum):
 
 class Chunker:
 
-    def __init__(self, 
+    def __init__(self,
                  strategy: ChunkingStrategy = ChunkingStrategy.SEMANTIC,
                  max_tokens: int = 512,
                  overlap: int = 50,
@@ -29,7 +29,7 @@ class Chunker:
         self.max_tokens = max_tokens
         self.overlap = overlap
         self.tokenizer = None
-        
+
         if use_tokenizer and HAS_TRANSFORMERS:
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(model_name)
@@ -161,22 +161,27 @@ class Chunker:
             self, elements: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         Simple fixed-size chunking ignoring element boundaries mostly.
+        Respects word boundaries to avoid splitting words.
         """
         chunks = []
         full_text = "\n\n".join(
             [e.get('content', '') for e in elements if e.get('content')])
 
-        # This is a very naive implementation, treating the whole doc as one string
-        # A better one would preserve metadata mapping.
-        # For now, let's just map back to elements loosely.
-
         current_pos = 0
         text_len = len(full_text)
-        chunk_char_limit = self.max_tokens * 4  # Approx
+        chunk_char_limit = self.max_tokens * 4  # Approx 4 chars per token
 
         chunk_idx = 0
         while current_pos < text_len:
             end_pos = min(current_pos + chunk_char_limit, text_len)
+
+            # Optimization: Adjust end_pos to avoid splitting words
+            if end_pos < text_len:
+                # Look for the last whitespace within the limit
+                last_space = full_text.rfind(' ', current_pos, end_pos)
+                if last_space != -1:
+                    end_pos = last_space + 1  # Include the space
+
             chunk_text = full_text[current_pos:end_pos]
 
             chunks.append({
@@ -190,7 +195,20 @@ class Chunker:
                 "token_count": self.count_tokens(chunk_text)
             })
 
-            current_pos = end_pos - (self.overlap * 4)  # Overlap in chars
+            # Calculate next position with overlap
+            # We also want to ensure the overlap start is at a word boundary if possible
+            next_pos = end_pos - (self.overlap * 4)
+            if next_pos < current_pos:  # Ensure forward progress
+                next_pos = current_pos + 1
+
+            # Adjust next_pos to start at a word boundary
+            if next_pos < text_len and next_pos > 0:
+                # Find the previous space to start cleanly
+                prev_space = full_text.rfind(' ', 0, next_pos)
+                if prev_space != -1:
+                    next_pos = prev_space + 1
+
+            current_pos = next_pos
             chunk_idx += 1
 
         return chunks

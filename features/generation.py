@@ -651,21 +651,14 @@ Answer: C - Placeholder answer due to AI unavailability."""
 
         return [slide]
 
-    def split_paragraph_into_chunks(self,
-                                    text: str,
-                                    max_words: int,
-                                    topic_title: str = "") -> list:
+    def _apply_domain_specific_fixes(self, text: str, topic_title: str) -> str:
         """
-        Use Ollama to intelligently split a paragraph at logical concept boundaries.
+        Apply domain-specific fixes to text to prevent common hallucinations.
         """
         # Fix specific data extraction errors (Unit Errors)
         # "150, by" -> "150,000 by"
         # "250, peop" -> "250,000 peop"
         text = re.sub(r'(\d{2,3}),\s+(by|peop)', r'\1,000 \2', text)
-
-        # ------------------------------------------------------------------
-        # CRITICAL FIXES FOR HALLUCINATIONS (Direct Text Replacement)
-        # ------------------------------------------------------------------
 
         # 1. Fix Table 1 Misinterpretation (Slide 6.1)
         # Replace "fiscal capacity/economic indicator" with "Population Change"
@@ -720,7 +713,16 @@ Answer: C - Placeholder answer due to AI unavailability."""
         text = text.replace("trends from 2015 to projections",
                             "trends from 2024 to projections")
 
-        # ------------------------------------------------------------------
+        return text
+
+    def split_paragraph_into_chunks(self,
+                                    text: str,
+                                    max_words: int,
+                                    topic_title: str = "") -> list:
+        """
+        Use Ollama to intelligently split a paragraph at logical concept boundaries.
+        """
+        text = self._apply_domain_specific_fixes(text, topic_title)
 
         # Detect Markdown tables - return as single chunk to prevent hallucination
         if "|" in text and "---" in text:
@@ -1008,6 +1010,22 @@ Do NOT add explanation or comments, ONLY the chunked text:
             # Use original main_part (e.g. "Page 1") to look up dynamic title
             # If not found, fall back to main_part itself
             chapter_title = chapter_title_map.get(main_part, main_part)
+
+            # === CUSTOM LOGIC FOR PAGE 1 (Introduction) ===
+            # Goal: Merge Page 1 content into the Introduction chapter (Chapter 0)
+            # and skip redundant abstract/header info
+            if "Page 1" in main_part:
+                # Force title to match existing Introduction chapter
+                chapter_title = "Introduction"
+
+                # Skip Header and Abstract as they are covered by _create_intro_slide
+                if "Header" in topic_title or "Abstract" in topic_title:
+                    logger.info(
+                        f"Skipping redundant Page 1 topic: {topic_title}")
+                    continue
+
+                # For other Page 1 topics (e.g. Charts), map to a subchapter
+                sub_part = "Visual Analysis (Page 1)"
 
             # === CUSTOM LOGIC FOR PAGE 2 GROUPING ===
             # Goal: Merge Title + Abstract into one slide, Main Text into next, then Questions.
@@ -1494,7 +1512,12 @@ Do NOT add explanation or comments, ONLY the chunked text:
             # Check against dynamic chapter title instead of raw main_part
             current_title_check = state.current_chapter.main_title if state.current_chapter else None
 
-            if not state.current_chapter or current_title_check != chapter_title:
+            # Special case for Introduction: If we are mapping to "Introduction",
+            # check if current chapter is already "Introduction" (Chapter 0)
+            if chapter_title == "Introduction" and current_title_check == "Introduction":
+                # Do NOT start a new chapter, just continue adding to Chapter 0
+                pass
+            elif not state.current_chapter or current_title_check != chapter_title:
                 chapter_changed = True
                 # Flush previous slide buffer
                 if state.slide_buffer:
@@ -1508,31 +1531,40 @@ Do NOT add explanation or comments, ONLY the chunked text:
                 # === QUESTIONNAIRE GENERATION LOGIC ===
                 # Check if we should generate a questionnaire for the PREVIOUS batch of chapters
                 # We do this before starting the new chapter
+                # SKIP Q/A FOR INTRODUCTION OR OVERVIEW CHAPTERS
                 if self.enable_questionnaire and state.current_chapter and state.current_chapter.chapter_num is not None:
-                    state.chapters_since_last_questionnaire += 1
-                    if state.chapters_since_last_questionnaire >= self.questionnaire_frequency:
-                        logger.info(
-                            f"Generating questionnaire after {state.chapters_since_last_questionnaire} chapters..."
-                        )
-                        # Get the last N chapters
-                        relevant_chapters = state.chapters[
-                            -state.chapters_since_last_questionnaire:]
-                        q_slides = self.generate_questionnaire_slides(
-                            relevant_chapters)
-
-                        if q_slides:
-                            # Append to the LAST chapter (the one just finished)
-                            target_chapter = state.chapters[-1]
-                            for slide in q_slides:
-                                target_chapter.add_slide(
-                                    slide, "Review & Assessment")
-                                state.subchapter_slides[
-                                    "Review & Assessment"].append(slide)
+                    if state.current_chapter.main_title not in [
+                            "Introduction", "Presentation Overview",
+                            "Executive Summary"
+                    ]:
+                        state.chapters_since_last_questionnaire += 1
+                        if state.chapters_since_last_questionnaire >= self.questionnaire_frequency:
                             logger.info(
-                                f"Added {len(q_slides)} questionnaire slides to Chapter {target_chapter.chapter_num}"
+                                f"Generating questionnaire after {state.chapters_since_last_questionnaire} chapters..."
                             )
+                            # Get the last N chapters
+                            relevant_chapters = state.chapters[
+                                -state.chapters_since_last_questionnaire:]
+                            q_slides = self.generate_questionnaire_slides(
+                                relevant_chapters)
 
-                        state.chapters_since_last_questionnaire = 0
+                            if q_slides:
+                                # Append to the LAST chapter (the one just finished)
+                                target_chapter = state.chapters[-1]
+                                for slide in q_slides:
+                                    target_chapter.add_slide(
+                                        slide, "Review & Assessment")
+                                    state.subchapter_slides[
+                                        "Review & Assessment"].append(slide)
+                                logger.info(
+                                    f"Added {len(q_slides)} questionnaire slides to Chapter {target_chapter.chapter_num}"
+                                )
+
+                            state.chapters_since_last_questionnaire = 0
+                    else:
+                        logger.info(
+                            f"Skipping Q/A for {state.current_chapter.main_title}"
+                        )
 
                 state.current_chapter_num += 1
                 state.current_chapter = Chapter(state.current_chapter_num,
@@ -2154,6 +2186,12 @@ Do NOT add explanation or comments, ONLY the chunked text:
                 }
             } for ch in state.chapters]
         }
+
+        # Include lists of all figures and tables if present in input
+        if "all_figures" in doc:
+            json_output["all_figures"] = doc["all_figures"]
+        if "all_tables" in doc:
+            json_output["all_tables"] = doc["all_tables"]
 
         if save_json and output_file:
             json_path = output_file.replace(".md", ".json")

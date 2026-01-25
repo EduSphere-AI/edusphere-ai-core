@@ -1,233 +1,127 @@
-# EduSphere AI Core - Authentication Service
+# EduSphere AI Core - Backend Service
 
-This service provides authentication functionality with support for:
+The Core Backend for EduSphere AI, a comprehensive service designed to handle heavy AI processing tasks including document extraction, chunking, summarization, and generation. Built with FastAPI and Python.
 
-- Email/Password authentication
-- Google authentication via Firebase
-- JWT token-based authorization
-- PostgreSQL database storage
+## 🏗️ Architecture & Features
 
-## Setup
+This service acts as the intelligence engine for the platform, providing:
 
-### 1. Install Dependencies
+- **Authentication:** Secure user management via Firebase and JWT.
+- **RAG Pipeline (Retrieval-Augmented Generation):**
+  - **Extraction:** extract text and structure from PDFs/Docs using `pdfplumber` and `pdf2docx`.
+  - **Chunking:** Semantic segmentation of content for better context retention.
+  - **Embedding & Storage:** (Planned/implied via dependencies) using Vector datastores.
+  - **Generation:** Content generation using LLMs (local/remote via `ollama`).
+  - **Summarization:** Automated improvements of educational texts.
+- **Database:** PostgreSQL (via SQLAlchemy & AsyncPG) and support for Firestore/Supabase.
+- **Async Processing:** Efficient handling of long-running AI tasks.
 
-```bash
-# Using uv (recommended)
-uv sync
+## 🛠️ Technology Stack
 
-# Or using pip
-pip install -e .
-```
+- **Framework:** [FastAPI](https://fastapi.tiangolo.com/)
+- **Database:** PostgreSQL, Supabase, Firestore, MongoDB (Motor)
+- **AI/ML:**
+  - `ollama`, `transformers` for LLM interaction
+  - `gliner` for Named Entity Recognition (NER)
+  - `nltk`, `scikit-learn` for NLP tasks
+- **Document Processing:** `pdfplumber`, `pymupdf`, `python-docx`
+- **Package Management:** [uv](https://github.com/astral-sh/uv) (for fast Python package management)
 
-### 2. Set up PostgreSQL Database
+## 🚀 Getting Started
 
-Create a PostgreSQL database:
+### Prerequisites
 
-```sql
-CREATE DATABASE edusphere;
-```
+- Python 3.12+
+- `uv` (recommended) or `pip`
+- PostgreSQL
 
-### 3. Configure Environment Variables
+### Installation
 
-Copy the example environment file and update with your credentials:
+1. **Clone the repository:**
 
-```bash
-cp .env.example .env
-```
+   ```bash
+   git clone <repository-url>
+   cd edusphere-ai-core
+   ```
 
-Edit `.env` and update:
+2. **Install Dependencies:**
+   We strictly recommend using `uv` for dependency management.
 
-- `DATABASE_URL`: Your PostgreSQL connection string
-- `SECRET_KEY`: A secure random string for JWT signing (generate with `openssl rand -hex 32`)
-- `FIREBASE_CREDENTIALS_PATH`: Path to your Firebase service account JSON file
+   ```bash
+   uv sync
+   ```
 
-### 4. Firebase Setup (for Google Auth)
+   _Alternatively with pip:_
 
-1. Go to [Firebase Console](https://console.firebase.google.com/)
-2. Create a new project or select existing one
-3. Go to Project Settings > Service Accounts
-4. Click "Generate New Private Key"
-5. Save the JSON file as `firebase-credentials.json` in the project root
-6. Enable Google authentication in Firebase Console > Authentication > Sign-in method
+   ```bash
+   pip install -e .
+   ```
 
-### 5. Run the Application
+3. **Database Setup:**
+   Ensure you have a PostgreSQL instance running.
 
-```bash
-uvicorn main:app --reload
-```
+   ```sql
+   CREATE DATABASE edusphere;
+   ```
 
-The API will be available at `http://localhost:8000`
+4. **Configuration:**
+   Copy `.env.example` (or create a new `.env` file) and configure the following:
 
-## API Endpoints
+   ```bash
+   # Database
+   DATABASE_URL=postgresql+asyncpg://user:password@localhost/edusphere
 
-### Authentication
+   # Security
+   SECRET_KEY=your_secret_key_here  # Generate with: openssl rand -hex 32
 
-#### Register with Email/Password
+   # Firebase
+   FIREBASE_CREDENTIALS_PATH=firebase-credentials.json
 
-```http
-POST /auth/register
-Content-Type: application/json
+   # External Services (if used)
+   SUPABASE_URL=...
+   SUPABASE_KEY=...
+   ```
 
-{
-  "email": "user@example.com",
-  "password": "securepassword123",
-  "full_name": "John Doe"
-}
-```
+5. **Initialize Database:**
+   Run the initialization scripts to set up schemas.
+   ```bash
+   python init_scripts/init_db.py
+   ```
 
-**Response:**
+### Running the Application
 
-```json
-{
-	"access_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-	"token_type": "bearer",
-	"user": {
-		"id": 1,
-		"email": "user@example.com",
-		"full_name": "John Doe",
-		"auth_provider": "email",
-		"is_active": true,
-		"is_verified": false,
-		"created_at": "2025-11-11T10:00:00Z"
-	}
-}
-```
-
-#### Login with Email/Password
-
-```http
-POST /auth/login
-Content-Type: application/json
-
-{
-  "email": "user@example.com",
-  "password": "securepassword123"
-}
-```
-
-**Response:** Same as register
-
-#### Google Authentication
-
-```http
-POST /auth/google
-Content-Type: application/json
-
-{
-  "firebase_token": "eyJhbGciOiJSUzI1NiIsImtpZCI6IjE...",
-  "full_name": "John Doe"
-}
-```
-
-**Response:** Same as register
-
-**Client-side Flow:**
-
-1. User signs in with Google using Firebase SDK on the client
-2. Client gets Firebase ID token: `const token = await user.getIdToken()`
-3. Client sends token to `/auth/google` endpoint
-4. Server verifies token, creates/updates user, returns JWT
-
-## Database Schema
-
-### Users Table
-
-```sql
-CREATE TABLE users (
-    id SERIAL PRIMARY KEY,
-    email VARCHAR UNIQUE NOT NULL,
-    hashed_password VARCHAR,
-    full_name VARCHAR,
-    firebase_uid VARCHAR UNIQUE,
-    auth_provider VARCHAR DEFAULT 'email',
-    is_active BOOLEAN DEFAULT true,
-    is_verified BOOLEAN DEFAULT false,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE
-);
-```
-
-## Client Integration Example
-
-### React + Firebase
-
-```javascript
-import { initializeApp } from "firebase/app";
-import { getAuth, signInWithPopup, GoogleAuthProvider } from "firebase/auth";
-
-// Initialize Firebase
-const firebaseConfig = {
-	/* your config */
-};
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-
-// Google Sign-In
-async function signInWithGoogle() {
-	const provider = new GoogleAuthProvider();
-
-	try {
-		const result = await signInWithPopup(auth, provider);
-		const token = await result.user.getIdToken();
-
-		// Send to your backend
-		const response = await fetch("http://localhost:8000/auth/google", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify({ firebase_token: token }),
-		});
-
-		const data = await response.json();
-		// Store data.access_token for future API calls
-		localStorage.setItem("token", data.access_token);
-	} catch (error) {
-		console.error("Error during sign in:", error);
-	}
-}
-```
-
-## Security Notes
-
-1. **Never commit** your `.env` file or `firebase-credentials.json` to version control
-2. Use strong, randomly generated `SECRET_KEY` in production
-3. Enable HTTPS in production
-4. Consider implementing rate limiting on auth endpoints
-5. Add email verification for email/password registration
-6. Implement refresh tokens for better security
-
-## API Documentation
-
-Once the server is running, visit:
-
-- Swagger UI: `http://localhost:8000/docs`
-- ReDoc: `http://localhost:8000/redoc`
-
-## PDF Extraction
-
-The project includes an intelligent PDF extraction feature located in `features/extraction.py`.
-
-### Usage
-
-To run the extraction on a PDF file:
+Start the development server using `uv`:
 
 ```bash
-python features/extraction.py
+uv run uvicorn main:app --reload
 ```
 
-By default, it processes `data/input.pdf`.
+The API docs will be available at `http://localhost:8000/docs`.
 
-### Options
+## 📂 Project Structure
 
-- `--pages`: Specify specific pages to extract (1-based index). Useful for debugging specific pages.
+```
+edusphere-ai-core/
+├── data/               # Local storage for uploads/images
+├── docs/               # Detailed documentation files
+├── features/           # Core AI Logic Modules
+│   ├── chunking.py     # Text segmentation logic
+│   ├── extraction.py   # PDF/Docx text extraction
+│   ├── generation.py   # LLM generation pipelines
+│   └── summarization.py # Content summarization
+├── init_scripts/       # DB & Environment setup scripts
+├── models/             # Pydantic & SQLAlchemy Models
+├── services/           # Business logic services (Auth, Websocket)
+├── utils/              # Helper functions & logging
+├── config.py           # Application configuration
+└── main.py             # Entry point
+```
+
+## 🧪 Testing
+
+You can use the `.http` files in `tests/` for quick API testing using VS Code REST Client extensions, or run Python tests if configured.
 
 ```bash
-# Extract only page 4
-python features/extraction.py --pages 4
-
-# Extract pages 1, 3, and 5
-python features/extraction.py --pages 1 3 5
+# Example manual run
+python manual_run.py
 ```
-
-## License
-
-MIT
