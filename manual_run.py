@@ -1,6 +1,27 @@
 import os
+import sys
 import json
 import logging
+
+# ============================================================================
+# SET ENCODING BEFORE ANY OTHER IMPORTS
+# ============================================================================
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+# Force UTF-8 on Windows for stdout/stderr
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer,
+        encoding='utf-8',
+        errors='replace'
+    )
+    sys.stderr = io.TextIOWrapper(
+        sys.stderr.buffer,
+        encoding='utf-8',
+        errors='replace'
+    )
+
 from config import settings
 from features.extraction import Extraction
 from features.summarization import Summarizer
@@ -45,20 +66,33 @@ def main():
     # 2. Summarization
     logger.info("--- Step 2: Summarization ---")
 
-    # Read extraction result
-    with open(extraction_output, 'r') as f:
-        extraction_data = json.load(f)
+    # Read extraction result with UTF-8 encoding
+    try:
+        with open(extraction_output, 'r', encoding='utf-8') as f:
+            extraction_data = json.load(f)
+    except UnicodeDecodeError as e:
+        logger.error(f"Failed to read extraction output with UTF-8: {e}")
+        logger.info("Attempting to read with error handling...")
+        with open(extraction_output, 'r', encoding='utf-8', errors='replace') as f:
+            extraction_data = json.load(f)
+    except Exception as e:
+        logger.error(f"Error reading extraction output: {e}")
+        return
 
     summarizer = Summarizer()
     summary_result = summarizer.summarize(extraction_data)
 
-    # Save summary result
+    # Save summary result with UTF-8 encoding
     summary_dir = settings.summarization_output_dir
     os.makedirs(summary_dir, exist_ok=True)
     summary_output_path = os.path.join(summary_dir, "summary_result.json")
 
-    with open(summary_output_path, 'w') as f:
-        json.dump(summary_result, f, indent=2, ensure_ascii=False)
+    try:
+        with open(summary_output_path, 'w', encoding='utf-8') as f:
+            json.dump(summary_result, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        logger.error(f"Error saving summary: {e}")
+        return
 
     logger.info(f"Summarization completed. Saved to {summary_output_path}")
 
@@ -71,8 +105,12 @@ def main():
     generator = SlideGenerator()
     # Use summarization output as input for generation
     # This enables using the detailed summaries instead of raw extraction
-    generator.generate(input_file=summary_output_path,
-                       output_file=generation_output)
+    try:
+        generator.generate(input_file=summary_output_path,
+                           output_file=generation_output)
+    except Exception as e:
+        logger.error(f"Error during generation: {e}")
+        return
 
     logger.info(f"Generation completed. Saved to {generation_output}")
 

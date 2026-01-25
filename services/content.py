@@ -1,3 +1,27 @@
+# ============================================================================
+# SET ENCODING AT THE VERY TOP - BEFORE ANY OTHER IMPORTS
+# ============================================================================
+import os
+import sys
+os.environ['PYTHONIOENCODING'] = 'utf-8'
+
+# Force UTF-8 on Windows for stdout/stderr
+if sys.platform == 'win32':
+    import io
+    sys.stdout = io.TextIOWrapper(
+        sys.stdout.buffer,
+        encoding='utf-8',
+        errors='replace'
+    )
+    sys.stderr = io.TextIOWrapper(
+        sys.stderr.buffer,
+        encoding='utf-8',
+        errors='replace'
+    )
+
+# ============================================================================
+# NOW IMPORT EVERYTHING ELSE
+# ============================================================================
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from models.database import get_db, FirestoreDAO
 from features.summarization import Summarizer
@@ -14,7 +38,6 @@ from firebase_admin import firestore
 import asyncio
 import logging
 import json
-import os
 import requests
 import uuid
 import shutil
@@ -116,8 +139,15 @@ async def process_full_pipeline(job_id: str, document_id: str, file_path: str,
                                extract_images=True)
         await loop.run_in_executor(None, extractor.extract)
 
-        with open(extraction_output_file, 'r') as f:
-            extraction_data = json.load(f)
+        # ✅ FIX: Add encoding='utf-8' to file read
+        try:
+            with open(extraction_output_file, 'r', encoding='utf-8') as f:
+                extraction_data = json.load(f)
+        except UnicodeDecodeError as e:
+            logger.error(f"Failed to read extraction output with UTF-8: {e}")
+            logger.info("Attempting to read with error handling...")
+            with open(extraction_output_file, 'r', encoding='utf-8', errors='replace') as f:
+                extraction_data = json.load(f)
 
         # 1.1 Upload extracted images to Supabase
         image_urls = []
