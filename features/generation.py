@@ -1011,6 +1011,67 @@ Do NOT add explanation or comments, ONLY the chunked text:
             # If not found, fall back to main_part itself
             chapter_title = chapter_title_map.get(main_part, main_part)
 
+            # === GENERIC IMAGE INJECTION FOR ALL PAGES ===
+            # Attempt to find a "segregated" infographic for the current page and inject it
+            page_match = re.search(r'Page\s*(\d+)', main_part, re.IGNORECASE)
+            if page_match:
+                page_num = page_match.group(1)
+                page_key = f"page_{page_num}"
+
+                img_path = None
+                # Priority 1: Look for 'segregated' image for this Page
+                for path in self.image_url_map:
+                    if page_key in path.lower() and "segregated" in path.lower(
+                    ):
+                        img_path = path
+                        break
+
+                # Priority 2 (Fallback): Look for any 'figure' or 'image' for this Page if explicit segregated not found
+                # ONLY if we are in Page 1 (Introduction) where visuals are critical
+                if not img_path and page_num == "1":
+                    for path in self.image_url_map:
+                        if page_key in path.lower() and any(
+                                x in path.lower()
+                                for x in ["fig", "chart", "image"]):
+                            img_path = path
+                            break
+
+                if img_path:
+                    # Check if we already added it to avoid duplicates in the current buffer
+                    has_image = any(
+                        item.type == "figure"
+                        and item.metadata.get("image_path") == img_path
+                        for item in state.slide_buffer)
+
+                    # Also check if we already added it to the current chapter (to avoid repeating on every topic of the same page)
+                    # This is important because a Page can have multiple topics
+                    already_in_chapter = False
+                    if state.current_chapter:
+                        for s in state.current_chapter.slides:
+                            for item in s.items:
+                                if item.type == "figure" and item.metadata.get(
+                                        "image_path") == img_path:
+                                    already_in_chapter = True
+                                    break
+                            if already_in_chapter: break
+
+                    if not has_image and not already_in_chapter:
+                        logger.info(
+                            f"Injecting segregated image for {main_part}: {img_path}"
+                        )
+                        state.slide_buffer.append(
+                            ContentItem("figure",
+                                        "",
+                                        metadata={
+                                            "caption":
+                                            f"Visual Overview: {main_part}",
+                                            "image_path":
+                                            img_path,
+                                            "image_url":
+                                            self.image_url_map.get(
+                                                img_path, "")
+                                        }))
+
             # === CUSTOM LOGIC FOR PAGE 1 (Introduction) ===
             # Goal: Merge Page 1 content into the Introduction chapter (Chapter 0)
             # and skip redundant abstract/header info
@@ -1533,7 +1594,8 @@ Do NOT add explanation or comments, ONLY the chunked text:
                 # We do this before starting the new chapter
                 # SKIP Q/A FOR INTRODUCTION OR OVERVIEW CHAPTERS
                 if self.enable_questionnaire and state.current_chapter and state.current_chapter.chapter_num is not None:
-                    if state.current_chapter.main_title not in [
+                    # Custom Rule: Skip Chapter 1 explicitly as well
+                    if state.current_chapter.chapter_num > 1 and state.current_chapter.main_title not in [
                             "Introduction", "Presentation Overview",
                             "Executive Summary"
                     ]:
@@ -2079,7 +2141,8 @@ Do NOT add explanation or comments, ONLY the chunked text:
         for chapter in state.chapters:
             # Skip learn controls for Introduction chapter (Chapter 1)
             # HARDCODED RULE: No questions for Chapter 1
-            if chapter.chapter_num == 1 or "Introduction" in chapter.main_title:
+            if (chapter.chapter_num is not None and chapter.chapter_num
+                    <= 1) or "Introduction" in chapter.main_title:
                 logger.info(
                     f"Skipping learn controls for Chapter {chapter.chapter_num}: {chapter.main_title} (Introduction)"
                 )
