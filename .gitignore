@@ -44,6 +44,9 @@ htmlcov/
 
 # Output Data
 /output
+backend startup commands.txt
+
+edusphere_ai_core.egg-info
 
 # Python egg-info
 /edusphere_ai_core.egg-info
