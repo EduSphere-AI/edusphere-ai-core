@@ -3,6 +3,7 @@
 # ============================================================================
 import os
 import sys
+from utils.ollama_translator import OllamaTranslator
 os.environ['PYTHONIOENCODING'] = 'utf-8'
 
 # Force UTF-8 on Windows for stdout/stderr
@@ -405,12 +406,58 @@ async def start_process(request: UploadURLRequest,
     background_tasks.add_task(process_full_pipeline, job_id, document_id,
                               file_path, db)
 
+    #4. Translation Step (if applicable)
+    if target_language != 'en':
+            await db.update_job(job_id, {
+                "stage": "translation",
+                "message": f"Translating content to {target_language} with Ollama"
+            })
+            
+            try:
+                translator = OllamaTranslator(model='mistral')
+                
+                logger.info(f"Translating slides to {target_language}...")
+                slides = await loop.run_in_executor(
+                    None,
+                    translator.translate_slides,
+                    slides,
+                    target_language
+                )
+                
+                logger.info(f"Translating chapters to {target_language}...")
+                chapters = await loop.run_in_executor(
+                    None,
+                    translator.translate_list,
+                    chapters,
+                    target_language
+                )
+                
+                logger.info(f"Translating summary to {target_language}...")
+                summary = await loop.run_in_executor(
+                    None,
+                    translator.translate_dict,
+                    summary,
+                    target_language
+                )
+                
+                logger.info(f"Translation completed for {target_language}")
+                
+                await db.update_job(job_id, {
+                    "stage": "translation_done",
+                    "message": f"Translation to {target_language} completed"
+                })
+                
+            except Exception as e:
+                logger.error(f"Translation failed: {e}")
+                await db.update_job(job_id, {
+                    "stage": "translation_error",
+                    "message": f"Translation failed: {str(e)}"
+                })
     return {
         "message": "Processing started",
         "job_id": job_id,
         "document_id": document_id
     }
-
 
 # Backward compatibility (Upload from URL) - maps to start_process logic
 @router.post("/upload-url")
