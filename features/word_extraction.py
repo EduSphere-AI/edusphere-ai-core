@@ -60,6 +60,7 @@ except ImportError:
         position: Optional[Position]
         style: TextStyle
         table_data: Optional[List[List[str]]] = None
+        table_headers: Optional[List[str]] = None
         image_context: Optional[ImageContext] = None
 
         def to_dict(self):
@@ -72,6 +73,8 @@ except ImportError:
                 self.content,
                 "table_data":
                 self.table_data,
+                "table_headers":
+                self.table_headers,
                 "image_context":
                 self.image_context.to_dict() if self.image_context else None
             }
@@ -135,7 +138,9 @@ class WordExtractor:
         except KeyError:
             return None
 
-    def extract_content(self) -> List[ContentElement]:
+    def extract_content(self,
+                        extract_images_only: bool = False
+                        ) -> List[ContentElement]:
         """Extract content (text, tables, images) from DOCX in order."""
         if not os.path.exists(self.docx_path):
             self.convert_pdf_to_docx()
@@ -175,6 +180,9 @@ class WordExtractor:
                                         image_context=ImageContext(
                                             image_path=image_path)))
 
+                if extract_images_only:
+                    continue
+
                 # 2. Handle Text
                 text = paragraph.text.strip()
                 if text:
@@ -190,6 +198,8 @@ class WordExtractor:
                         ))
 
             elif isinstance(element, CT_Tbl):
+                if extract_images_only:
+                    continue
                 table = Table(element, doc)
                 table_data = []
                 for row in table.rows:
@@ -197,10 +207,21 @@ class WordExtractor:
                     table_data.append(row_data)
 
                 if table_data:
-                    # Create a string representation for content
-                    # e.g. CSV-like or just JSON
-                    content_str = "\n".join(
-                        [" | ".join(row) for row in table_data])
+                    # Assume first row is header if we have data
+                    headers = table_data[0] if table_data else []
+                    body = table_data[1:] if len(table_data) > 1 else []
+
+                    # Create a string representation for content (Markdown-like)
+                    content_lines = []
+                    if headers:
+                        content_lines.append(" | ".join(headers))
+                        content_lines.append(" | ".join(["---"] *
+                                                        len(headers)))
+
+                    for row in body:
+                        content_lines.append(" | ".join(row))
+
+                    content_str = "\n".join(content_lines)
 
                     elements.append(
                         ContentElement(id=str(uuid.uuid4()),
@@ -208,7 +229,8 @@ class WordExtractor:
                                        content=content_str,
                                        position=None,
                                        style=TextStyle(font_size=11.0),
-                                       table_data=table_data))
+                                       table_data=body,
+                                       table_headers=headers))
 
         logger.info(f"Extracted {len(elements)} elements")
         return elements
@@ -218,8 +240,18 @@ if __name__ == "__main__":
     # Test block
     import sys
     if len(sys.argv) > 1:
-        pdf_file = sys.argv[1]
-        extractor = WordExtractor(pdf_file, "output_test")
-        elements = extractor.extract_content()
-        print(
-            json.dumps([e.to_dict() for e in elements], indent=2, default=str))
+        images_only = "--images-only" in sys.argv
+        if images_only:
+            sys.argv.remove("--images-only")
+
+        if len(sys.argv) > 1:
+            pdf_file = sys.argv[1]
+            extractor = WordExtractor(pdf_file, "output_test")
+            elements = extractor.extract_content(
+                extract_images_only=images_only)
+            print(
+                json.dumps([e.to_dict() for e in elements],
+                           indent=2,
+                           default=str))
+        else:
+            print("Please provide a PDF file path.")

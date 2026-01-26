@@ -1,27 +1,3 @@
-# ============================================================================
-# SET ENCODING AT THE VERY TOP - BEFORE ANY OTHER IMPORTS
-# ============================================================================
-import os
-import sys
-os.environ['PYTHONIOENCODING'] = 'utf-8'
-
-# Force UTF-8 on Windows for stdout/stderr
-if sys.platform == 'win32':
-    import io
-    sys.stdout = io.TextIOWrapper(
-        sys.stdout.buffer,
-        encoding='utf-8',
-        errors='replace'
-    )
-    sys.stderr = io.TextIOWrapper(
-        sys.stderr.buffer,
-        encoding='utf-8',
-        errors='replace'
-    )
-
-# ============================================================================
-# NOW IMPORT EVERYTHING ELSE
-# ============================================================================
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, WebSocket, WebSocketDisconnect
 from models.database import get_db, FirestoreDAO
 from features.summarization import Summarizer
@@ -38,12 +14,217 @@ from firebase_admin import firestore
 import asyncio
 import logging
 import json
+import os
 import requests
 import uuid
 import shutil
+import ollama
+from typing import List, Dict, Any
 
 router = APIRouter(prefix="/content", tags=["content"])
 logger = logging.getLogger(__name__)
+
+
+class SummarizeSlideRequest(BaseModel):
+    result_id: str
+    chapter_num: int
+    slide_num: int
+    strength: str = "standard"  # standard, strong
+
+
+class ConfirmSummaryRequest(BaseModel):
+    result_id: str
+    chapter_num: int
+    slide_num: int
+    new_content: List[Dict[str, Any]]
+
+
+async def summarize_slide_content(items: List[Dict[str, Any]],
+                                  strength: str) -> List[Dict[str, Any]]:
+    """
+    Summarize text content within slide items using Ollama.
+    Retains structure (items count and types).
+    """
+    # Filter text items
+    text_indices = []
+    text_parts = []
+
+    for i, item in enumerate(items):
+        if item.get("type") in ["paragraph", "bullet"]:
+            text_indices.append(i)
+            # Add label for context
+            label = str(item.get("type", "unknown")).upper()
+            content = item.get("text", "") or item.get("content", "")
+            text_parts.append(f"[{label} {len(text_indices)}]: {content}")
+
+    if not text_parts:
+        return items
+
+    combined_text = "\n\n".join(text_parts)
+
+    strength_instruction = "Make it concise."
+    if strength == "strong":
+        strength_instruction = "Make it VERY concise. Use fewer words. Be direct."
+
+    prompt = f"""You are an expert slide editor. Summarize the following content items.
+    
+    Instructions:
+    1. Maintain the exact number of items ({len(text_parts)}).
+    2. Maintain the type of each item (Paragraph vs Bullet).
+    3. {strength_instruction}
+    4. Do not lose critical data or numbers.
+    5. Output strictly in the format:
+       [PARAGRAPH 1]: <Summary>
+       [BULLET 2]: <Summary>
+       ...
+    
+    Original Content:
+    {combined_text}
+    """
+
+    try:
+        # Use asyncio to run blocking ollama call
+        loop = asyncio.get_running_loop()
+        response = await loop.run_in_executor(
+            None, lambda: ollama.generate(model='llama3.2', prompt=prompt))
+        response_text = response['response']
+
+        # Parse response
+        import re
+        summarized_items = items.copy()
+
+        # Regex to find [TYPE N]: Content
+        # We iterate through our expected indices to find matches
+        for idx_in_list, original_idx in enumerate(text_indices):
+            # Construct expected tag roughly (allow loose matching)
+            # Match [TYPE N]: ...
+            # N is 1-based index in our text_parts list
+            n = idx_in_list + 1
+            pattern = re.compile(
+                rf"\[(?:PARAGRAPH|BULLET) {n}\]:\s*(.*?)(?=\n\[(?:PARAGRAPH|BULLET) \d+\]:|$)",
+                re.DOTALL | re.IGNORECASE)
+            match = pattern.search(response_text)
+
+            if match:
+                new_text = match.group(1).strip()
+                if "text" in summarized_items[original_idx]:
+                    summarized_items[original_idx]["text"] = new_text
+                elif "content" in summarized_items[original_idx]:
+                    summarized_items[original_idx]["content"] = new_text
+
+        return summarized_items
+
+    except Exception as e:
+        logger.error(f"Summarization failed: {e}")
+        # Return original on failure
+        return items
+
+
+@router.post("/summarize/preview")
+async def summarize_slide_preview(request: SummarizeSlideRequest,
+                                  db: FirestoreDAO = Depends(get_db)):
+    """
+    Generates a summarized version of a slide's content.
+    Returns the original and summarized content for preview.
+    """
+    if not db.db:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    try:
+        # 1. Fetch generation results
+        doc_ref = db.db.collection('documents').document(
+            request.result_id).collection('results').document('generation')
+        doc = doc_ref.get()
+        if not doc.exists:
+            # Fallback to job result if not in subcollection?
+            # For now, assume standard path.
+            raise HTTPException(status_code=404,
+                                detail="Generation results not found")
+
+        data = doc.to_dict()
+        slides = data.get('slides', [])
+
+        # 2. Find target slide
+        target_slide = None
+        for slide in slides:
+            # Check matching logic
+            # Support both 'slide_number' and 'sequence' keys
+            s_num = slide.get('slide_number')
+            if s_num is None:
+                s_num = slide.get('sequence')
+
+            if slide.get(
+                    'chapter'
+            ) == request.chapter_num and s_num == request.slide_num:
+                target_slide = slide
+                break
+
+        if not target_slide:
+            raise HTTPException(status_code=404, detail="Slide not found")
+
+        # 3. Summarize
+        original_content = target_slide.get('content', [])
+        summarized_content = await summarize_slide_content(
+            original_content, request.strength)
+
+        return {
+            "original_content": original_content,
+            "summarized_content": summarized_content
+        }
+
+    except Exception as e:
+        logger.error(f"Error in summarize_preview: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/summarize/confirm")
+async def confirm_summary(request: ConfirmSummaryRequest,
+                          db: FirestoreDAO = Depends(get_db)):
+    """
+    Saves the confirmed summarized content to Firestore.
+    """
+    if not db.db:
+        raise HTTPException(status_code=500, detail="Database not connected")
+
+    try:
+        doc_ref = db.db.collection('documents').document(
+            request.result_id).collection('results').document('generation')
+
+        # We need to read-modify-write.
+        # Simplified non-transactional update for now to avoid linter issues with async/sync mixing
+        snapshot = doc_ref.get()
+        if not snapshot.exists:
+            raise HTTPException(status_code=404, detail="Result not found")
+
+        data = snapshot.to_dict()
+        slides = data.get('slides', [])
+
+        updated = False
+        for i, slide in enumerate(slides):
+            # Support both 'slide_number' and 'sequence' keys
+            s_num = slide.get('slide_number')
+            if s_num is None:
+                s_num = slide.get('sequence')
+
+            if slide.get(
+                    'chapter'
+            ) == request.chapter_num and s_num == request.slide_num:
+                slides[i]['content'] = request.new_content
+                updated = True
+                break
+
+        if updated:
+            doc_ref.update({"slides": slides})
+            return {
+                "status": "success",
+                "message": "Slide updated successfully"
+            }
+        else:
+            raise HTTPException(status_code=404, detail="Slide not found")
+
+    except Exception as e:
+        logger.error(f"Error in confirm_summary: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 def upload_image_to_supabase(file_path: str, destination_path: str) -> str:
@@ -139,15 +320,8 @@ async def process_full_pipeline(job_id: str, document_id: str, file_path: str,
                                extract_images=True)
         await loop.run_in_executor(None, extractor.extract)
 
-        # ✅ FIX: Add encoding='utf-8' to file read
-        try:
-            with open(extraction_output_file, 'r', encoding='utf-8') as f:
-                extraction_data = json.load(f)
-        except UnicodeDecodeError as e:
-            logger.error(f"Failed to read extraction output with UTF-8: {e}")
-            logger.info("Attempting to read with error handling...")
-            with open(extraction_output_file, 'r', encoding='utf-8', errors='replace') as f:
-                extraction_data = json.load(f)
+        with open(extraction_output_file, 'r') as f:
+            extraction_data = json.load(f)
 
         # 1.1 Upload extracted images to Supabase
         image_urls = []
@@ -261,8 +435,8 @@ async def process_full_pipeline(job_id: str, document_id: str, file_path: str,
         })
 
         chunker = Chunker()
-        chunks_data = await loop.run_in_executor(None, chunker.process,
-                                                 extraction_data)
+        chunks_data = await loop.run_in_executor(
+            None, lambda: chunker.process(extraction_data))
 
         # --- 3. SUMMARIZATION / GENERATION ---
         await db.update_job(job_id, {
@@ -273,9 +447,8 @@ async def process_full_pipeline(job_id: str, document_id: str, file_path: str,
         summarizer = Summarizer()
 
         # Now returns a dict with 'slides', 'chapters', 'summary'
-        result_data = await loop.run_in_executor(None,
-                                                 summarizer.generate_slides,
-                                                 extraction_data)
+        result_data = await loop.run_in_executor(
+            None, lambda: summarizer.generate_slides(extraction_data))
 
         slides = result_data.get("slides", [])
         chapters = result_data.get("chapters", [])

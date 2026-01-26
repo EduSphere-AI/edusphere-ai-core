@@ -39,7 +39,8 @@ OPTIMAL_SLIDE_WORDS = 200  # Increased for more detail
 MAX_SLIDE_WORDS = 400  # Increased limit
 MIN_SLIDE_WORDS = 50  # Minimum before considering slide complete
 MAX_BULLETS_PER_SLIDE = 10  # Increased
-MAX_PARAGRAPHS_PER_SLIDE = 4
+MAX_PARAGRAPHS_PER_SLIDE = 2
+MAX_WORDS_PER_PARAGRAPH = 100
 
 # Element weights (equivalent words)
 FIGURE_WEIGHT = 100
@@ -53,6 +54,51 @@ SKIP_SECTION_TITLES = {
 SKIP_KEYWORDS = {
     "phone:", "fax:", "publishers", "editors", "editorial", "volume"
 }
+
+
+def render_table_to_markdown(data: List[Dict[str, Any]],
+                             headers: Optional[List[str]] = None) -> str:
+    """Render table data to Markdown format"""
+    if not data:
+        return ""
+
+    # Check first row to detect format
+    first_row = data[0]
+    is_list_wrapper = "row" in first_row and isinstance(first_row["row"], list)
+
+    # 1. Determine Headers
+    if not headers:
+        if is_list_wrapper:
+            # Generate generic headers
+            col_count = len(first_row["row"])
+            headers = [f"Column {i+1}" for i in range(col_count)]
+        else:
+            # Use keys as headers
+            headers = list(first_row.keys())
+
+    # 2. Build Markdown
+    md_lines = []
+
+    # Header Row
+    md_lines.append("| " + " | ".join(headers) + " |")
+    md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+    # Data Rows
+    for row in data:
+        if is_list_wrapper:
+            values = [str(x) for x in row.get("row", [])]
+        else:
+            values = [str(row.get(h, "")) for h in headers]
+
+        # Pad or truncate to match header count
+        if len(values) < len(headers):
+            values.extend([""] * (len(headers) - len(values)))
+        elif len(values) > len(headers):
+            values = values[:len(headers)]
+
+        md_lines.append("| " + " | ".join(values) + " |")
+
+    return "\n".join(md_lines)
 
 
 class OllamaCache:
@@ -125,6 +171,52 @@ class Slide:
         """Check if slide contains any figures"""
         return any(item.type == "figure" for item in self.items)
 
+    def _render_table_md(self,
+                         data: List[Dict[str, Any]],
+                         headers: Optional[List[str]] = None) -> str:
+        """Render table data to Markdown format"""
+        if not data:
+            return ""
+
+        # Check first row to detect format
+        first_row = data[0]
+        is_list_wrapper = "row" in first_row and isinstance(
+            first_row["row"], list)
+
+        # 1. Determine Headers
+        if not headers:
+            if is_list_wrapper:
+                # Generate generic headers
+                col_count = len(first_row["row"])
+                headers = [f"Column {i+1}" for i in range(col_count)]
+            else:
+                # Use keys as headers
+                headers = list(first_row.keys())
+
+        # 2. Build Markdown
+        md_lines = []
+
+        # Header Row
+        md_lines.append("| " + " | ".join(headers) + " |")
+        md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+
+        # Data Rows
+        for row in data:
+            if is_list_wrapper:
+                values = [str(x) for x in row.get("row", [])]
+            else:
+                values = [str(row.get(h, "")) for h in headers]
+
+            # Pad or truncate to match header count
+            if len(values) < len(headers):
+                values.extend([""] * (len(headers) - len(values)))
+            elif len(values) > len(headers):
+                values = values[:len(headers)]
+
+            md_lines.append("| " + " | ".join(values) + " |")
+
+        return "\n".join(md_lines)
+
     def render_markdown(self) -> str:
         """Render slide to markdown"""
         lines = []
@@ -158,11 +250,21 @@ class Slide:
                 caption = item.metadata.get("caption", "Table")
                 image_path = item.metadata.get(
                     "image_url") or item.metadata.get("image_path", "")
+                table_data = item.metadata.get("table_data")
+                table_headers = item.metadata.get("table_headers")
 
                 if image_path:
                     lines.append(f"\n![{caption}]({image_path})")
 
                 lines.append(f"\n**Table:** {caption}\n")
+
+                if item.content:
+                    lines.append(item.content)
+                    lines.append("\n")
+                elif table_data:
+                    lines.append(
+                        render_table_to_markdown(table_data, table_headers))
+                    lines.append("\n")
 
         lines.append("\n---\n")
         return "\n".join(lines)
@@ -441,7 +543,7 @@ CRITICAL: Interpret all standalone numbers as PERCENTAGES or INDEX POINTS, NOT C
     def generate_learn_controls(self, subchapter_title: str,
                                 slide_contents: list) -> list:
         """
-        Generate 4 open-ended learning control questions using Ollama at different cognitive levels.
+        Generate 5 open-ended learning control questions using Ollama at different cognitive levels.
         """
         # Clean title for prompt usage to avoid mechanical references
         # Remove (Section X), (Box X), Page X -
@@ -460,13 +562,14 @@ CRITICAL: Interpret all standalone numbers as PERCENTAGES or INDEX POINTS, NOT C
             return []
 
         prompt = f"""You are an expert instructional designer creating assessment questions. Given the following academic content 
-from a section titled "{clean_title}", generate exactly 4 open-ended reflection questions that test different cognitive levels.
+from a section titled "{clean_title}", generate exactly 5 open-ended reflection questions that test different cognitive levels.
 For each question, provide a concise model answer.
 
 1. One DEFINITION/COMPREHENSION question: Testing understanding of key concepts
 2. One ANALYSIS/EXPLANATION question: Testing how concepts relate to each other
 3. One APPLICATION/EVALUATION question: Testing real-world or practical implications
 4. One CRITICAL THINKING question: Asking learners to question or extend the content
+5. One SYNTHESIS/FUTURE OUTLOOK question: Connecting to broader themes or future implications
 
 CRITICAL INSTRUCTIONS FOR QUESTION PHRASING:
 - DO NOT reference the document structure (e.g., "In this section", "According to the text", "As shown in the graph", "In Section 7").
@@ -487,6 +590,9 @@ A3: [Model Answer]
 
 Q4: [Question text]
 A4: [Model Answer]
+
+Q5: [Question text]
+A5: [Model Answer]
 """
 
         text = self.call_ollama(prompt, fallback_value=None)
@@ -577,53 +683,65 @@ A4: [Model Answer]
         titles_str = ", ".join(chapter_titles)
 
         prompt = f"""You are an expert educator creating a review quiz. 
-Based on the content from the following chapters: {titles_str}, generate 3 multiple-choice questions with answers.
+        Based on the content from the following chapters: {titles_str}, generate 5 multiple-choice questions with answers.
 
-Content:
-{combined_text}
+        Content:
+        {combined_text}
 
-Format the output EXACTLY as follows:
-Q1: [Question text]
-A) [Option A]
-B) [Option B]
-C) [Option C]
-D) [Option D]
-Answer: [Correct Option Letter] - [Brief Explanation]
+        Format the output EXACTLY as follows:
+        Q1: [Question text]
+        A) [Option A]
+        B) [Option B]
+        C) [Option C]
+        D) [Option D]
+        Answer: [Correct Option Letter] - [Brief Explanation]
 
-Q2: ...
-...
-"""
+        Q2: ...
+        ...
+        Q5: ...
+        """
         response = self.call_ollama(prompt)
         if not response:
             logger.warning(
                 "Ollama unavailable for questionnaire. Using fallback.")
             response = f"""Q1: Review Question for {titles_str}
-A) Option A
-B) Option B
-C) Option C
-D) Option D
-Answer: A - Placeholder answer due to AI unavailability.
+            A) Option A
+            B) Option B
+            C) Option C
+            D) Option D
+            Answer: A - Placeholder answer due to AI unavailability.
 
-Q2: Key Concept Check
-A) Concept 1
-B) Concept 2
-C) Concept 3
-D) Concept 4
-Answer: B - Placeholder answer due to AI unavailability.
+            Q2: Key Concept Check
+            A) Concept 1
+            B) Concept 2
+            C) Concept 3
+            D) Concept 4
+            Answer: B - Placeholder answer due to AI unavailability.
 
-Q3: Critical Analysis
-A) Analysis Point 1
-B) Analysis Point 2
-C) Analysis Point 3
-D) Analysis Point 4
-Answer: C - Placeholder answer due to AI unavailability."""
+            Q3: Critical Analysis
+            A) Analysis Point 1
+            B) Analysis Point 2
+            C) Analysis Point 3
+            D) Analysis Point 4
+            Answer: C - Placeholder answer due to AI unavailability.
+            
+            Q4: Application Check
+            A) App Point 1
+            B) App Point 2
+            C) App Point 3
+            D) App Point 4
+            Answer: D - Placeholder answer due to AI unavailability.
+            
+            Q5: Synthesis Question
+            A) Syn Point 1
+            B) Syn Point 2
+            C) Syn Point 3
+            D) Syn Point 4
+            Answer: A - Placeholder answer due to AI unavailability."""
 
         # Parse response into slide content
         items = []
         items.append(ContentItem("paragraph", f"Review of: {titles_str}"))
-
-        # Simple parsing - just add as paragraphs/bullets
-        # We want to format it nicely.
 
         lines = response.split('\n')
         current_q = ""
@@ -770,6 +888,7 @@ where each chunk covers ONE concept and is approximately {max_words} words.
 Each chunk should be pedagogically complete and understandable independently.
 Maintain the original text exactly—do not paraphrase or summarize.
 CRITICAL: Do not change any numbers or data values. Keep the text verbatim.{special_instruction}
+CRITICAL: Output strictly the chunked text blocks. Do NOT output JSON. Do NOT wrap content in curly braces {{}}.
 
 Respond in this format:
 [CHUNK 1]
@@ -783,14 +902,54 @@ Do NOT add explanation or comments, ONLY the chunked text:
 
         result_text = self.call_ollama(prompt, fallback_value=None)
         if result_text:
+            # Check for JSON leakage in the full response
+            if result_text.strip().startswith(
+                    '{') and result_text.strip().endswith('}'):
+                # Try to clean it
+                cleaned = self._clean_slide_content(result_text)
+                if cleaned != result_text:
+                    result_text = cleaned
+
             # Parse chunks from response
             chunks = RE_CHUNK_BOUNDARY.split(result_text)
             chunks = [c.strip() for c in chunks if c.strip()]
+
+            # Clean individual chunks just in case
+            chunks = [self._clean_slide_content(c) for c in chunks]
+
             if chunks:
                 return chunks
 
         # Fallback to simple sentence-based chunking
         return self._fallback_chunking(text, max_words)
+
+    def _clean_slide_content(self, content: str) -> str:
+        """
+        Clean slide content to ensure it's plain text, not JSON string.
+        """
+        content = content.strip()
+
+        # Check if content looks like a JSON object
+        if content.startswith('{') and content.endswith('}'):
+            try:
+                # Try to parse it
+                data = json.loads(content)
+                # If it's a simple wrapper like {"summary": "..."} or {"content": "..."}
+                # extract the inner value
+                if isinstance(data, dict):
+                    if "summary" in data:
+                        return data["summary"]
+                    if "content" in data:
+                        return data["content"]
+                    if "text" in data:
+                        return data["text"]
+                    # If multiple keys or unknown structure, maybe return nicely formatted JSON?
+                    # Or just the first string value?
+                    # For now, return the whole thing if no obvious key
+            except json.JSONDecodeError:
+                pass  # Not valid JSON, treat as text
+
+        return content
 
     def _fallback_chunking(self, text: str, max_words: int) -> list:
         """Fallback sentence-based chunking when Ollama unavailable."""
@@ -923,12 +1082,12 @@ Do NOT add explanation or comments, ONLY the chunked text:
         if key_quote:
             intro_items.append(ContentItem("paragraph", f"_\"{key_quote}\"_"))
 
-        # Add to state as Chapter 0 (Introduction)
-        state.current_chapter_num = 0
-        state.current_chapter = Chapter(None, "Introduction")
+        # Add to state as Chapter 1 (Introduction)
+        state.current_chapter_num = 1
+        state.current_chapter = Chapter(1, "Introduction")
         state.chapters.append(state.current_chapter)
 
-        slide = Slide(None, 1, "Presentation Overview", intro_items)
+        slide = Slide(1, 1, "Introduction Overview", intro_items)
         state.current_chapter.add_slide(slide, "Introduction")
         state.subchapter_slides["Introduction"].append(slide)
         logger.info("Created Introduction slide (Chapter None).")
@@ -1075,7 +1234,7 @@ Do NOT add explanation or comments, ONLY the chunked text:
             # === CUSTOM LOGIC FOR PAGE 1 (Introduction) ===
             # Goal: Merge Page 1 content into the Introduction chapter (Chapter 0)
             # and skip redundant abstract/header info
-            if "Page 1" in main_part:
+            if re.search(r'Page\s*1\b', main_part):
                 # Force title to match existing Introduction chapter
                 chapter_title = "Introduction"
 
@@ -1095,7 +1254,7 @@ Do NOT add explanation or comments, ONLY the chunked text:
 
             should_merge_with_previous = False
 
-            if "Page 2" in main_part:
+            if re.search(r'Page\s*2\b', main_part):
                 # 1. Force common subchapter for Page 2 to ensure questions appear after the whole sequence
                 sub_part = "Analysis & Overview"
 
@@ -1596,7 +1755,7 @@ Do NOT add explanation or comments, ONLY the chunked text:
                 if self.enable_questionnaire and state.current_chapter and state.current_chapter.chapter_num is not None:
                     # Custom Rule: Skip Chapter 1 explicitly as well
                     if state.current_chapter.chapter_num > 1 and state.current_chapter.main_title not in [
-                            "Introduction", "Presentation Overview",
+                            "Introduction", "Introduction Overview",
                             "Executive Summary"
                     ]:
                         state.chapters_since_last_questionnaire += 1
@@ -1695,7 +1854,7 @@ Do NOT add explanation or comments, ONLY the chunked text:
                 else:
                     # Regular paragraph - check for massive paragraphs
                     chunks = self.split_paragraph_into_chunks(
-                        p, current_max_words, topic_title)
+                        p, MAX_WORDS_PER_PARAGRAPH, topic_title)
                     for chunk in chunks:
                         item = ContentItem("paragraph", chunk)
                         temp_text_items.append(item)
@@ -1722,7 +1881,9 @@ Do NOT add explanation or comments, ONLY the chunked text:
                                 os.path.basename(img_path))
 
                     item = ContentItem("table",
-                                       vis.get("content", ""),
+                                       render_table_to_markdown(
+                                           vis.get("table_data"),
+                                           vis.get("table_headers")),
                                        metadata={
                                            "caption":
                                            vis.get("analysis", "Table"),
@@ -1776,14 +1937,23 @@ Do NOT add explanation or comments, ONLY the chunked text:
 
             # 3. Decision Logic
 
-            # Case A: Massive Content (> current_max_words)
+            # Case A: Massive Content (> current_max_words) OR Too Many Paragraphs
             # We must split.
-            if total_content_weight > current_max_words:
+            num_paragraphs = sum(1 for item in temp_text_items
+                                 if item.type == "paragraph")
+
+            if total_content_weight > current_max_words or num_paragraphs > MAX_PARAGRAPHS_PER_SLIDE:
                 # Add text items one by one with eager flushing
                 for item in temp_text_items:
                     state.slide_buffer.append(item)
                     state.buffer_word_count += item.word_count()
-                    if state.buffer_word_count >= current_optimal_words:
+
+                    # Check flush conditions: Word count OR Paragraph count
+                    current_buffer_paragraphs = sum(1
+                                                    for i in state.slide_buffer
+                                                    if i.type == "paragraph")
+
+                    if state.buffer_word_count >= current_optimal_words or current_buffer_paragraphs >= MAX_PARAGRAPHS_PER_SLIDE:
                         title = self.generate_slide_title(state.slide_buffer)
                         slide = state.flush_slide_buffer(title)
                         if slide and state.current_chapter:
@@ -1836,6 +2006,19 @@ Do NOT add explanation or comments, ONLY the chunked text:
                   (temp_visual_items or temp_image_items)) or (
                       total_content_weight > current_max_words):
                 # 1. Flush Text Slide
+
+                # Check for paragraph overflow (Merge scenario)
+                current_buffer_paragraphs = sum(1 for i in state.slide_buffer
+                                                if i.type == "paragraph")
+                if current_buffer_paragraphs + num_paragraphs > MAX_PARAGRAPHS_PER_SLIDE:
+                    title = self.generate_slide_title(state.slide_buffer)
+                    slide = state.flush_slide_buffer(title)
+                    if slide and state.current_chapter:
+                        state.current_chapter.add_slide(
+                            slide, state.current_subchapter)
+                        state.subchapter_slides[
+                            state.current_subchapter].append(slide)
+
                 state.slide_buffer.extend(temp_text_items)
                 title = self.generate_slide_title(state.slide_buffer)
                 slide = state.flush_slide_buffer(title)
@@ -1863,6 +2046,18 @@ Do NOT add explanation or comments, ONLY the chunked text:
 
             # Case C: Smart Fit (Small/Medium Text + Visuals fit together)
             else:
+                # Check if adding triggers limit (Merge scenario)
+                current_buffer_paragraphs = sum(1 for i in state.slide_buffer
+                                                if i.type == "paragraph")
+                if current_buffer_paragraphs + num_paragraphs > MAX_PARAGRAPHS_PER_SLIDE:
+                    title = self.generate_slide_title(state.slide_buffer)
+                    slide = state.flush_slide_buffer(title)
+                    if slide and state.current_chapter:
+                        state.current_chapter.add_slide(
+                            slide, state.current_subchapter)
+                        state.subchapter_slides[
+                            state.current_subchapter].append(slide)
+
                 state.slide_buffer.extend(temp_text_items)
                 state.slide_buffer.extend(temp_visual_items)
                 state.slide_buffer.extend(
@@ -2084,16 +2279,17 @@ Do NOT add explanation or comments, ONLY the chunked text:
                                                    metadata=media)
                                 weight = FIGURE_WEIGHT
                         elif el_type == "table":
-                            item = ContentItem("table",
-                                               "Table data",
-                                               metadata={
-                                                   "caption":
-                                                   content or "Data Table",
-                                                   "table_data":
-                                                   element.get("table_data"),
-                                                   "table_headers":
-                                                   element.get("table_headers")
-                                               })
+                            item = ContentItem(
+                                "table",
+                                render_table_to_markdown(
+                                    element.get("table_data"),
+                                    element.get("table_headers")),
+                                metadata={
+                                    "caption": content or "Data Table",
+                                    "table_data": element.get("table_data"),
+                                    "table_headers":
+                                    element.get("table_headers")
+                                })
                             weight = TABLE_WEIGHT
 
                         if item:

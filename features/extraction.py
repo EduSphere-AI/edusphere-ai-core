@@ -210,13 +210,18 @@ class ContentElement:
         if self.image_context:
             result["image_context"] = self.image_context.to_dict()
         if self.table_data:
-            # Wrap rows in dicts ONLY if they are lists (to avoid nested arrays for Firestore)
-            # If they are already dicts (strict mode), keep them as is.
+            # Always ensure consistent list-of-rows format
+            # If internal data is list-of-lists, wrap in {"row": ...} for Firestore
+            # If internal data is already dicts (e.g. {"col": "val"}), keep as is
             formatted_data = []
             for row in self.table_data:
                 if isinstance(row, list):
                     formatted_data.append({"row": row})
+                elif isinstance(row, dict) and "row" in row:
+                    # Already wrapped
+                    formatted_data.append(row)
                 else:
+                    # Dict with keys, or unknown
                     formatted_data.append(row)
             result["table_data"] = formatted_data
             result["table_headers"] = self.table_headers
@@ -774,6 +779,12 @@ class Extraction:
         if text_clean.isupper() and len(text_clean.split()) <= 5:
             if "ABSTRACT" in text_clean:
                 return ElementType.ABSTRACT
+
+            # Filter out sequences of short codes (chart labels)
+            words = text_clean.split()
+            if all(len(w) <= 3 for w in words):
+                return None  # Treat as normal paragraph or filtered out later
+
             if len(text_clean) < 50:
                 return ElementType.SECTION_TITLE
         return None
@@ -838,6 +849,16 @@ class Extraction:
         # Hardcoded fix for specific document issue where "2011 census..." is misclassified as footnote
         # This paragraph starts with a year which triggers the footnote number detection
         if text_clean.startswith("2011 census, meaning some adjustments"):
+            return ElementType.PARAGRAPH
+
+        # --- LENGTH SAFEGUARD ---
+        # If text is very long (> 150 chars), it CANNOT be a Title/Header/Headline/SectionTitle.
+        # It must be a Paragraph or CallOutBox.
+        if len(text_clean) > 150:
+            # Check if it looks like a Quote or Callout
+            if text_clean.startswith(('"', '“')):
+                return ElementType.QUOTE
+            # Default to Paragraph for long text
             return ElementType.PARAGRAPH
 
         baseline_size = self._get_baseline_font_size()
@@ -1023,7 +1044,7 @@ class Extraction:
             return []
 
         images = []
-        visual_bboxes = self._get_visual_bboxes(page)
+        visual_bboxes = self._get_visual_bboxes(page, page_num)
         text_regions = text_regions or []
 
         # Get page dimensions for clipping
@@ -1092,6 +1113,20 @@ class Extraction:
                     image_path = os.path.join(self.images_dir, image_filename)
                     pil_image.save(image_path)
 
+                # Special handling for Page 3: Crop margins
+                elif page_num == 2:
+                    w, h = pil_image.size
+                    # Increase cropping to remove more whitespace and metadata
+                    top_margin = 100
+                    bottom_margin = 150
+                    if h > (top_margin + bottom_margin):
+                        pil_image = pil_image.crop(
+                            (0, top_margin, w, h - bottom_margin))
+
+                    image_filename = f"page_{page_num + 1}_figure_{img_idx + 1}.png"
+                    image_path = os.path.join(self.images_dir, image_filename)
+                    pil_image.save(image_path)
+
                 # Special handling for Page 6 & 7: Split Grid of Graphs into 3 rows
                 elif page_num == 5 or page_num == 6:
                     # Default fallback: uniform split
@@ -1154,8 +1189,15 @@ class Extraction:
 
                     # Add to extracted images list so it gets uploaded
                     images.append(
-                        ContentElement(type="image",
+                        ContentElement(id=self._generate_id("image_split"),
+                                       type="image",
                                        content="",
+                                       position=Position(x0=bbox[0],
+                                                         y0=bbox[1],
+                                                         x1=bbox[2],
+                                                         y1=bbox[3],
+                                                         page=page_num + 1),
+                                       style=TextStyle(font_size=0),
                                        metadata={
                                            "image_path":
                                            f"images/{row1_filename}",
@@ -1170,8 +1212,15 @@ class Extraction:
                     row2_img.save(row2_path)
 
                     images.append(
-                        ContentElement(type="image",
+                        ContentElement(id=self._generate_id("image_split"),
+                                       type="image",
                                        content="",
+                                       position=Position(x0=bbox[0],
+                                                         y0=bbox[1],
+                                                         x1=bbox[2],
+                                                         y1=bbox[3],
+                                                         page=page_num + 1),
+                                       style=TextStyle(font_size=0),
                                        metadata={
                                            "image_path":
                                            f"images/{row2_filename}",
@@ -1186,8 +1235,15 @@ class Extraction:
                     row3_img.save(row3_path)
 
                     images.append(
-                        ContentElement(type="image",
+                        ContentElement(id=self._generate_id("image_split"),
+                                       type="image",
                                        content="",
+                                       position=Position(x0=bbox[0],
+                                                         y0=bbox[1],
+                                                         x1=bbox[2],
+                                                         y1=bbox[3],
+                                                         page=page_num + 1),
+                                       style=TextStyle(font_size=0),
                                        metadata={
                                            "image_path":
                                            f"images/{row3_filename}",
@@ -1261,8 +1317,10 @@ class Extraction:
 
         return images
 
-    def _get_visual_bboxes(self,
-                           page) -> List[Tuple[float, float, float, float]]:
+    def _get_visual_bboxes(
+            self,
+            page,
+            page_num: int = -1) -> List[Tuple[float, float, float, float]]:
         """Get bounding boxes of visual elements (images, charts, figures)."""
         visual_elements = []
         page_width = float(page.width)
@@ -1340,10 +1398,20 @@ class Extraction:
             # Filter: must be reasonable size (not too small, not too large)
             if w < 50 or h < 50:
                 continue
-            if area > page_area * 0.8:  # Relaxed: max 80% of page
-                continue
-            if h > page_height * 0.85:  # Skip nearly full-height elements
-                continue
+
+            # Special handling for Pages 6 & 7 (Fiscal Capacity Charts) - Allow larger/full-page figures
+            # Pages 6 & 7 are 0-indexed 5 & 6
+            is_large_chart_page = (page_num == 5 or page_num == 6)
+
+            if not is_large_chart_page:
+                if area > page_area * 0.8:  # Relaxed: max 80% of page
+                    continue
+                if h > page_height * 0.85:  # Skip nearly full-height elements
+                    continue
+            else:
+                # For Pages 6 & 7, we allow almost full page
+                if area > page_area * 0.95:
+                    continue
 
             # Try to split very wide bboxes that might contain multiple side-by-side figures
             # If bbox is very wide (>60% of page) and aspect ratio suggests side-by-side figures
@@ -2035,10 +2103,158 @@ Return ONLY a JSON object:
         try:
             return json.loads(response)
         except:
-            return {{}}
+            return {}
+
+    def _extract_tables_from_docx(self, page_num: int) -> List[ContentElement]:
+        """Extract tables from a specific page using pdf2docx."""
+        try:
+            from pdf2docx import Converter
+            from docx import Document
+            from docx.oxml.table import CT_Tbl
+            from docx.table import Table
+            import tempfile
+        except ImportError:
+            logger.warning(
+                "pdf2docx or python-docx not installed. Skipping DOCX table extraction."
+            )
+            return []
+
+        tables = []
+
+        # Create a temp docx file
+        # Use a safe temp filename
+        with tempfile.NamedTemporaryFile(suffix=".docx", delete=False) as tmp:
+            docx_path = tmp.name
+
+        try:
+            # Convert specific page (0-based index)
+            # Suppress stdout/stderr from pdf2docx if possible, or just let it log
+            cv = Converter(self.file_path)
+            cv.convert(docx_path, pages=[page_num])
+            cv.close()
+
+            # Extract tables
+            if os.path.exists(docx_path):
+                doc = Document(docx_path)
+                for element in doc.element.body:
+                    if isinstance(element, CT_Tbl):
+                        table = Table(element, doc)
+                        table_data = []
+                        for row in table.rows:
+                            row_data = [
+                                cell.text.strip() for cell in row.cells
+                            ]
+                            table_data.append(row_data)
+
+                        if table_data:
+                            # Check for meaningful content
+                            if not any(
+                                    any(cell for cell in row)
+                                    for row in table_data):
+                                continue
+
+                            # --- FILTERING LOGIC ---
+                            # Filter out text-layout artifacts (multi-column text masquerading as tables)
+
+                            is_valid_table = False
+
+                            # 1. Check Row Count
+                            # Real tables usually have > 3 rows (header + data)
+                            if len(table_data) < 3:
+                                # Unless it's a very short table, but text artifacts are often just 1 row
+                                continue
+
+                            # 2. Check Cell Content Length (Density Check)
+                            # Text artifacts have very long sentences in cells. Data tables have short values.
+                            # Calculate average cell length
+                            total_chars = sum(
+                                len(cell) for row in table_data
+                                for cell in row)
+                            total_cells = sum(len(row) for row in table_data)
+                            avg_cell_len = total_chars / total_cells if total_cells > 0 else 0
+
+                            # If average cell length is high (> 50 chars), it's likely text
+                            if avg_cell_len > 50:
+                                continue
+
+                            # 3. Specific Target Validation - REMOVED to support all pages
+                            # We rely on generic density/size checks above.
+                            is_valid_table = True
+
+                            # Format content string
+                            headers = table_data[0] if table_data else []
+                            body = table_data[1:] if len(
+                                table_data) > 1 else []
+
+                            content_lines = []
+                            if headers:
+                                content_lines.append(" | ".join(headers))
+                                content_lines.append(" | ".join(["---"] *
+                                                                len(headers)))
+
+                            for row in body:
+                                content_lines.append(" | ".join(row))
+
+                            content_str = "\n".join(content_lines)
+
+                            # Create a default position since DOCX doesn't give coords easily
+                            # We'll use the whole page or a placeholder
+                            # Using 0,0,0,0 might indicate "unknown position"
+                            pos = Position(x0=0.0,
+                                           y0=0.0,
+                                           x1=0.0,
+                                           y1=0.0,
+                                           page=page_num + 1)
+
+                            tables.append(
+                                ContentElement(
+                                    id=self._generate_id("table"),
+                                    type=ElementType.TABLE.value,
+                                    content=content_str,
+                                    position=pos,
+                                    style=TextStyle(font_size=11.0),
+                                    table_data=body,
+                                    table_headers=headers,
+                                    hierarchy_level=2,
+                                    metadata={"extraction_method": "docx"}))
+
+        except Exception as e:
+            logger.warning(
+                f"DOCX table extraction failed for page {page_num + 1}: {e}")
+        finally:
+            if os.path.exists(docx_path):
+                try:
+                    os.remove(docx_path)
+                except:
+                    pass
+
+        return tables
 
     def extract_tables(self, page, page_num: int) -> List[ContentElement]:
-        """Extract tables with structure and data."""
+        """Extract tables using DOCX conversion (preferred) or legacy fallback."""
+        # Restrict table extraction to specific pages as requested
+        # Page 5 (index 4) and Page 8 (index 7)
+        target_pages = [5, 8]
+        if (page_num + 1) not in target_pages:
+            return []
+
+        # For target pages (5 & 8), SKIP DOCX and force Vision/Legacy extraction
+        # This ensures we use the strict prompt formatting in _analyze_table_with_vision
+        if (page_num + 1) in target_pages:
+            return self._extract_tables_legacy(page, page_num)
+
+        # 1. Try DOCX Extraction
+        tables = self._extract_tables_from_docx(page_num)
+
+        if tables:
+            return tables
+
+        # 2. Fallback to Legacy Extraction
+        return self._extract_tables_legacy(page, page_num)
+
+    def _extract_tables_legacy(self, page,
+                               page_num: int) -> List[ContentElement]:
+        """Extract tables with structure and data (Legacy Method)."""
         tables = []
         page_width = float(page.width)
         page_height = float(page.height)
@@ -2065,11 +2281,26 @@ Return ONLY a JSON object:
                         f"Found {len(table_objects)} tables on Page 5 using text strategy."
                     )
 
-            for idx, table_data in enumerate(page_tables):
-                # Filter: Only extract tables for specific pages as requested
-                if (page_num + 1) not in [5, 8]:
-                    continue
+            # Special handling for Page 8 (Table 2) - Whitespace separated
+            if (page_num + 1) == 8:
+                logger.info(
+                    "Applying specialized table extraction for Page 8 (Table 2)..."
+                )
+                table_settings = {
+                    "vertical_strategy": "text",
+                    "horizontal_strategy": "text",
+                    "snap_tolerance": 5,
+                    "intersection_x_tolerance": 5,
+                }
+                # Force re-detection with these settings
+                table_objects = page.find_tables(table_settings)
+                page_tables = page.extract_tables(table_settings)
+                if table_objects:
+                    logger.info(
+                        f"Found {len(table_objects)} tables on Page 8 using text strategy."
+                    )
 
+            for idx, table_data in enumerate(page_tables):
                 if not table_data:
                     continue
 
@@ -2106,6 +2337,12 @@ Return ONLY a JSON object:
                 vision_success = False
                 headers = []
                 cleaned_rows = []
+
+                # Assume first row is header if available
+                if table_data:
+                    headers = table_data[0]
+                    cleaned_rows = table_data[1:]
+
                 table_title = ""
                 table_summary = ""
 
@@ -2272,22 +2509,8 @@ Return ONLY a JSON object:
                 if vision_success:
                     table_metadata["extraction_method"] = "vision"
 
-                    # Save the visual representation of the table/chart
-                    if self.images_dir:
-                        table_img_filename = f"w_table_page_{page_num + 1}_{len(tables) + 1}.png"
-                        table_img_path = os.path.join(self.images_dir,
-                                                      table_img_filename)
-
-                        try:
-                            # Ensure directory exists
-                            os.makedirs(self.images_dir, exist_ok=True)
-                            with open(table_img_path, "wb") as f:
-                                f.write(img_data)
-                            table_metadata["image_path"] = table_img_path
-                            logger.info(
-                                f"Saved table image to {table_img_path}")
-                        except Exception as e:
-                            logger.warning(f"Failed to save table image: {e}")
+                    # REMOVED: Saving table image logic
+                    # The user requested not to capture table images.
 
                 table_element = ContentElement(
                     id=self._generate_id("table"),
@@ -2998,7 +3221,8 @@ Return ONLY a JSON object:
         These are labels that should be part of the image context, not separate elements.
         """
         if not image_bboxes:
-            return elements
+            # Even if no images detected, still filter obvious chart junk
+            image_bboxes = []
 
         filtered = []
         for elem in elements:
@@ -3008,6 +3232,13 @@ Return ONLY a JSON object:
                     ElementType.TABLE.value
             ]:
                 filtered.append(elem)
+                continue
+
+            # Global filtering for obvious chart artifacts (sequences of short uppercase codes)
+            # e.g. "HE NW SL RP SH"
+            words = elem.content.strip().split()
+            if len(words) > 1 and all(
+                    len(w) <= 3 and w.isupper() for w in words):
                 continue
 
             # Check if element is inside any image bbox (with padding)
@@ -4195,6 +4426,11 @@ Return ONLY the JSON object. Be conservative - only flag OBVIOUS mistakes."""
                         for elem in page_elements:
                             if elem.id in refined_map:
                                 elem.type = refined_map[elem.id]['type']
+
+                        # Sync back to page_dict to ensure preserved tables/figures are in final output
+                        page_dict["elements"] = [
+                            e.to_dict() for e in page_elements
+                        ]
 
                     extracted_data["pages"].append(page_dict)
                     all_elements.extend(page_elements)

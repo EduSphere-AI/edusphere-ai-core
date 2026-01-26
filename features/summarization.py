@@ -161,6 +161,22 @@ class Summarizer:
             })
 
             for slide in chapter.slides:
+                slide_content = []
+                for item in slide.items:
+                    content_item = {
+                        "type": item.type,
+                        "text": item.content,
+                        "metadata": item.metadata
+                    }
+                    # Lift table_data to root for frontend compatibility
+                    if item.type == "table" and item.metadata:
+                        if "table_data" in item.metadata:
+                            content_item["table_data"] = item.metadata["table_data"]
+                        if "table_headers" in item.metadata:
+                            content_item["table_headers"] = item.metadata["table_headers"]
+                    
+                    slide_content.append(content_item)
+
                 slide_dict = {
                     "sequence":
                     slide.slide_num,  # Simplified sequence
@@ -168,11 +184,7 @@ class Summarizer:
                     slide.title,
                     "chapter":
                     chapter.chapter_num,  # Add chapter num to slide
-                    "content": [{
-                        "type": item.type,
-                        "text": item.content,
-                        "metadata": item.metadata
-                    } for item in slide.items],
+                    "content": slide_content,
                     "chapter_title":
                     chapter.main_title,
                     "chapter_main_title":
@@ -699,8 +711,16 @@ class Summarizer:
 
         # Rows
         for row in rows:
+            cells = []
+            if isinstance(row, dict) and "row" in row:
+                cells = row["row"]
+            elif isinstance(row, list):
+                cells = row
+            else:
+                cells = list(row.values()) if isinstance(row, dict) else [str(row)]
+
             md_lines.append("| " + " | ".join(str(cell)
-                                              for cell in row) + " |")
+                                              for cell in cells) + " |")
 
         return "\n".join(md_lines)
 
