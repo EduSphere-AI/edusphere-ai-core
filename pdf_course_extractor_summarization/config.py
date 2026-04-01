@@ -1,0 +1,66 @@
+# pdf_course_extractor_summarization/config.py
+
+
+class Config:
+
+    DEFAULT_OUTPUT_DIR = "extracted_content"
+    IMAGES_DIR_NAME = "images"
+
+
+    TITLE_FONT_SIZE_THRESHOLD = 18
+    CHAPTER_FONT_SIZE_THRESHOLD = 14
+    SUBCHAPTER_FONT_SIZE_THRESHOLD = 12
+
+
+    MIN_IMAGE_WIDTH = 64
+    MIN_IMAGE_HEIGHT = 64
+
+
+    SUMMARIZER_MODEL = "facebook/bart-large-cnn"
+    QG_MODEL = "mrm8488/t5-base-finetuned-question-generation-ap"
+
+
+    DOC_MAX_CHARS = 6000
+    DOC_SUMMARY_MAX = 220
+    DOC_SUMMARY_MIN = 80
+
+
+    CHAPTER_MAX_CHARS = 4000
+    CHAPTER_SUMMARY_MAX = 180
+    CHAPTER_SUMMARY_MIN = 60
+
+
+    SUBCHAPTER_MAX_CHARS = 2500
+    SUBCHAPTER_SUMMARY_MAX = 140
+    SUBCHAPTER_SUMMARY_MIN = 50
+
+
+    FIGURE_MAX_CHARS = 1500
+    FIGURE_SUMMARY_MAX = 80
+    FIGURE_SUMMARY_MIN = 30
+
+
+    MIN_WORDS_FOR_SUMMARY = 40
+
+
+    ENABLE_QG = True
+    QG_DEFAULT_COUNT = 3
+    QUESTIONS_PER_SUBCHAPTER = 3
+
+
+    QG_KEYWORD_MIN_LEN = 4
+    QG_MIN_TOKENS = 5
+    QG_MIN_ALPHA_FRACTION = 0.6
+
+
+    MIN_WORDS_FOR_QG = 60
+    QG_MAX_CHARS = 1024
+
+
+    ENABLE_QUIZZES = True
+
+
+    QUIZ_BACKEND = ""
+
+
+    QUIZ_MAX_ITEMS_PER_SUBCHAPTER = 3
